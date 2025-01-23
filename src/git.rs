@@ -1,6 +1,9 @@
+use std::process::Command;
+
 use anyhow::{Context, Result};
 use chrono::naive::NaiveDate;
 use futures::TryStreamExt;
+use git2::{build::CheckoutBuilder, IntoCString, Repository};
 use tokio::pin;
 
 #[derive(Debug)]
@@ -92,6 +95,28 @@ pub async fn list_recent_reviews() -> Result<()> {
         });
     }
     println!("PRs: {:?}", prs);
+
+    Ok(())
+}
+
+pub fn tidy_merged_go_mod() -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let repo = Repository::open(&cwd)?;
+    repo.checkout_index(
+        None,
+        Some(
+            CheckoutBuilder::default()
+                .use_ours(true)
+                .path("go.mod")
+                .path("go.sum")
+                .force(),
+        ),
+    )?;
+
+    Command::new("go")
+        .args(["mod", "tidy"])
+        .current_dir(&cwd)
+        .output()?;
 
     Ok(())
 }

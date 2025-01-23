@@ -8,5 +8,6 @@ anyhow = "1.0.95"
 chrono = "0.4.39"
 clap = { version = "4.5.26", features = ["derive"] }
 futures = "0.3.31"
+git2 = "0.20.0"
 octocrab = { version = "0.42.1", features = ["stream"] }
 tokio = { version = "1.43.0", features = ["full"] }
