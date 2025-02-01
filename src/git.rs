@@ -97,25 +97,27 @@ impl<'a> Context<'a> {
             .run()?;
         match branch {
             Some(branch) => {
-                cmd!(self.sh, "git switch -c {branch}")
+                cmd!(self.sh, "git switch -C {branch}")
                     .quiet()
                     .ignore_stdout()
                     .ignore_stderr()
                     .run()?;
-                cmd!(self.sh, "git commit -m {message}")
+                cmd!(self.sh, "git commit -m {message} --no-verify")
                     .quiet()
                     .ignore_stdout()
-                    .run()?;
+                    .run()
+                    .unwrap_or(());
                 cmd!(self.sh, "git switch -")
                     .quiet()
                     .ignore_stdout()
                     .ignore_stderr()
                     .run()?;
             }
-            None => cmd!(self.sh, "git commit -m {message}")
+            None => cmd!(self.sh, "git commit -m {message} --no-verify")
                 .quiet()
                 .ignore_stdout()
-                .run()?,
+                .run()
+                .unwrap_or(()),
         }
         Ok(())
     }
