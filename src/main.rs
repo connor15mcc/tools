@@ -38,14 +38,15 @@ struct PoorMansRefactorator {
     repos_file: FileOrStdin,
 }
 
-#[derive(Args)]
+#[derive(Args, Debug)]
+#[group(requires_all = ["title", "body"])] // https://github.com/clap-rs/clap/issues/5092
 struct PrInfo {
     /// Title to use for newly-created PRs
-    #[arg(short, long, required = true)]
+    #[arg(short, long, required = false)]
     title: String,
 
     /// Body to use for newly-created PRs
-    #[arg(short, long, required = true)]
+    #[arg(short, long, required = false)]
     body: String,
 }
 

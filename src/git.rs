@@ -48,7 +48,7 @@ pub fn poor_mans_refactorator(
 
         let context = Context { sh: &sh };
         let Some((user, repo)) = repo
-            .strip_prefix("github.com:")
+            .strip_prefix("github.com/")
             .unwrap_or(&repo)
             .rsplit_once('/')
         else {
