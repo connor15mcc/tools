@@ -28,6 +28,10 @@ struct PoorMansRefactorator {
     #[clap(flatten)]
     pr_info: Option<PrInfo>,
 
+    // True to skip creating a PR and instead print a diff summary to stdout
+    #[arg(long)]
+    dry_run: bool,
+
     /// Command that will be invoked on each repo, with the resulting changes
     /// applied in a commit + put for review
     #[arg(required = true)]
@@ -58,6 +62,7 @@ fn main() {
         Commands::Pmr(PoorMansRefactorator {
             id,
             pr_info,
+            dry_run,
             command,
             repos_file,
         }) => {
@@ -72,7 +77,7 @@ fn main() {
                     .into_reader()
                     .expect("failed to convert to reader"),
             );
-            poor_mans_refactorator(&id, pr_info.as_ref(), command, reader)
+            poor_mans_refactorator(&id, pr_info.as_ref(), *dry_run, command, reader)
                 .expect("couldn't create / update all PRs")
         }
     }

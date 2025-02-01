@@ -31,6 +31,7 @@ pub fn tidy_merged_go_mod() -> Result<()> {
 pub fn poor_mans_refactorator(
     id: &str,
     pr_info: Option<&PrInfo>,
+    dry_run: bool,
     cmd: &str,
     repos: BufReader<impl Read>,
 ) -> Result<()> {
@@ -55,13 +56,18 @@ pub fn poor_mans_refactorator(
             anyhow::bail!("invalid repo: `{repo}` (expected github.com/user/repo)")
         };
         context.clone(user, repo)?;
-        let pr_url = {
+        {
             let _guard = sh.push_dir(repo);
             let _out = cmd!(sh, "sh -c").arg(cmd).read()?;
             context.commit(&format!("`sh -c {}`", cmd), Some(id))?;
-            context.create_pr(Some(id), pr_info)?
+            if !dry_run {
+                let pr_url = context.create_pr(Some(id), pr_info)?;
+                println!("{}", pr_url);
+            } else {
+                let diff = context.diff(id)?;
+                println!("{}", diff);
+            }
         };
-        println!("{}", pr_url);
     }
     Ok(())
 }
@@ -76,7 +82,7 @@ impl<'a> Context<'a> {
             .sh
             .path_exists(self.sh.current_dir().join(repo).join(".git"));
         if !dotgit_exists {
-            cmd!(self.sh, "git clone git@github.com:{user}/{repo}")
+            cmd!(self.sh, "git clone git@github.com:{user}/{repo} --filter=blob:limit=100k")
                 .quiet()
                 .ignore_stdout()
                 .ignore_stderr()
@@ -164,5 +170,9 @@ impl<'a> Context<'a> {
                 .run()?;
         }
         Ok(pr_url)
+    }
+
+    fn diff(&self, branch: &str) -> Result<String> {
+        Ok(cmd!(self.sh, "git diff HEAD...{branch} --numstat").quiet().ignore_stderr().read()?)
     }
 }
