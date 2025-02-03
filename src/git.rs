@@ -55,6 +55,7 @@ pub fn poor_mans_refactorator(
         else {
             anyhow::bail!("invalid repo: `{repo}` (expected github.com/user/repo)")
         };
+        println!("{repo}");
         context.clone(user, repo)?;
         {
             let _guard = sh.push_dir(repo);
@@ -62,10 +63,10 @@ pub fn poor_mans_refactorator(
             context.commit(&format!("`sh -c {}`", cmd), Some(id))?;
             if !dry_run {
                 let pr_url = context.create_pr(Some(id), pr_info)?;
-                println!("{}", pr_url);
+                println!("{pr_url}");
             } else {
                 let diff = context.diff(id)?;
-                println!("{}", diff);
+                println!("{diff}");
             }
         };
     }
