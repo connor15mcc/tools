@@ -28,7 +28,7 @@ struct PoorMansRefactorator {
     #[clap(flatten)]
     pr_info: Option<PrInfo>,
 
-    // True to skip creating a PR and instead print a diff summary to stdout
+    /// True to skip creating a PR and instead print a diff summary to stdout
     #[arg(long)]
     dry_run: bool,
 
