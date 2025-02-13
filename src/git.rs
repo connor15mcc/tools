@@ -59,7 +59,10 @@ pub fn poor_mans_refactorator(
         context.clone(user, repo)?;
         {
             let _guard = sh.push_dir(repo);
-            let _out = cmd!(sh, "sh -c").arg(cmd).read()?;
+            if let Err(e) = cmd!(sh, "sh -c").arg(cmd).quiet().run() {
+                println!("encountered {e}, skipping");
+                continue;
+            };
             context.commit(&format!("`sh -c {}`", cmd), Some(id))?;
             if !dry_run {
                 let pr_url = context.create_pr(Some(id), pr_info)?;
@@ -83,11 +86,14 @@ impl<'a> Context<'a> {
             .sh
             .path_exists(self.sh.current_dir().join(repo).join(".git"));
         if !dotgit_exists {
-            cmd!(self.sh, "git clone git@github.com:{user}/{repo} --filter=blob:limit=100k")
-                .quiet()
-                .ignore_stdout()
-                .ignore_stderr()
-                .run()?;
+            cmd!(
+                self.sh,
+                "git clone git@github.com:{user}/{repo} --filter=blob:limit=100k"
+            )
+            .quiet()
+            .ignore_stdout()
+            .ignore_stderr()
+            .run()?;
         }
 
         Ok(())
@@ -174,6 +180,9 @@ impl<'a> Context<'a> {
     }
 
     fn diff(&self, branch: &str) -> Result<String> {
-        Ok(cmd!(self.sh, "git diff HEAD...{branch} --numstat").quiet().ignore_stderr().read()?)
+        Ok(cmd!(self.sh, "git diff HEAD...{branch} --numstat")
+            .quiet()
+            .ignore_stderr()
+            .read()?)
     }
 }
