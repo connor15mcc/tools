@@ -1,5 +1,6 @@
 use clap::{Args, Parser, Subcommand};
 use clap_stdin::FileOrStdin;
+use decay::*;
 use git::{poor_mans_refactorator, tidy_merged_go_mod};
 use petname::Generator;
 use resolve_path::PathResolveExt;
@@ -100,7 +101,7 @@ fn main() {
             .expect("couldn't create / update all PRs")
         }
         Commands::Decay => {
-            let score = decay::score(decay::HackerNews).expect("couldn't calculate the score");
+            let score = score(InterestRate::new(0.05 / 12.0)).expect("couldn't calculate the score");
             println!("Decay score: {score:.2}")
         }
     }
