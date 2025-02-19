@@ -3,6 +3,7 @@ use anyhow::Result;
 use git2::{build::CheckoutBuilder, Repository};
 use std::io::BufRead;
 use std::io::Read;
+use std::path::PathBuf;
 use std::{io::BufReader, process::Command};
 use xshell::{cmd, Shell};
 
@@ -34,9 +35,9 @@ pub fn poor_mans_refactorator(
     dry_run: bool,
     cmd: &str,
     repos: BufReader<impl Read>,
+    dir: &PathBuf,
 ) -> Result<()> {
-    let dir = &format!(".run-{}", id);
-    let sh = Shell::new()?;
+    let sh = dbg!(Shell::new()?);
     if !sh.path_exists(dir) {
         sh.create_dir(dir)?;
     }
@@ -94,6 +95,21 @@ impl<'a> Context<'a> {
             .ignore_stdout()
             .ignore_stderr()
             .run()?;
+        }
+        let _guard = self.sh.push_dir(repo);
+
+        cmd!(
+            self.sh,
+            "git pull --force"
+        )
+        .quiet()
+        .ignore_stdout()
+        .ignore_stderr()
+        .run()?;
+
+        let branch = cmd!(self.sh, "git branch --show-current").quiet().ignore_stderr().read()?;
+        if !matches!(branch.as_str(), "main" | "master") {
+            anyhow::bail!("HEAD points to unexpected branch `{}`", branch);
         }
 
         Ok(())

@@ -1,15 +1,20 @@
 mod git;
+use resolve_path::PathResolveExt;
 use clap::{Args, Parser, Subcommand};
 use clap_stdin::FileOrStdin;
 use git::{poor_mans_refactorator, tidy_merged_go_mod};
 use petname::Generator;
 use std::io::BufReader;
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+
+    #[arg(short='p', long)]
+    checkout_path: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -57,6 +62,9 @@ struct PrInfo {
 fn main() {
     let cli = Cli::parse();
 
+    let checkout_path = cli.checkout_path.unwrap_or("~/mono/".resolve().to_path_buf());
+    dbg!(&checkout_path);
+
     match &cli.command {
         Commands::GoModMerge => tidy_merged_go_mod().expect("couldn't tidy go.mod / go.sum"),
         Commands::Pmr(PoorMansRefactorator {
@@ -77,8 +85,15 @@ fn main() {
                     .into_reader()
                     .expect("failed to convert to reader"),
             );
-            poor_mans_refactorator(&id, pr_info.as_ref(), *dry_run, command, reader)
-                .expect("couldn't create / update all PRs")
+            poor_mans_refactorator(
+                &id,
+                pr_info.as_ref(),
+                *dry_run,
+                command,
+                reader,
+                &checkout_path,
+            )
+            .expect("couldn't create / update all PRs")
         }
     }
 }
