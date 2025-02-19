@@ -9,5 +9,6 @@ clap = { version = "4.5.26", features = ["derive"] }
 clap-stdin = "0.6.0"
 git2 = "0.20.0"
 petname = "2.0.2"
+rayon = "1.10.0"
 resolve-path = "0.1.0"
 xshell = "0.2.7"

@@ -1,8 +1,10 @@
 use crate::PrInfo;
 use anyhow::Result;
 use git2::{build::CheckoutBuilder, Repository};
+use rayon::prelude::*;
 use std::io::BufRead;
 use std::io::Read;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::{io::BufReader, process::Command};
 use xshell::{cmd, Shell};
@@ -37,7 +39,24 @@ pub fn poor_mans_refactorator(
     repos: BufReader<impl Read>,
     dir: &PathBuf,
 ) -> Result<()> {
-    let sh = dbg!(Shell::new()?);
+    let repos = repos.lines().collect::<Result<Vec<_>, _>>()?;
+
+    repos
+        .par_iter()
+        .map(|repo| clone_and_do_work(id, pr_info, dry_run, cmd, repo, dir))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(())
+}
+
+fn clone_and_do_work(
+    id: &str,
+    pr_info: Option<&PrInfo>,
+    dry_run: bool,
+    cmd: &str,
+    repo: &str,
+    dir: &PathBuf,
+) -> Result<()> {
+    let sh = Shell::new()?;
     if !sh.path_exists(dir) {
         sh.create_dir(dir)?;
     }
@@ -45,34 +64,37 @@ pub fn poor_mans_refactorator(
 
     // TODO: figure out tracing, tmp path (should be logged in some way)
 
-    for repo in repos.lines() {
-        let repo = repo?;
+    let context = Context { sh: &sh };
+    let Some((user, repo)) = repo
+        .strip_prefix("github.com/")
+        .unwrap_or(&repo)
+        .rsplit_once('/')
+    else {
+        anyhow::bail!("invalid repo: `{repo}` (expected github.com/user/repo)")
+    };
+    context.clone(user, repo)?;
+    {
+        let _guard = sh.push_dir(repo);
 
-        let context = Context { sh: &sh };
-        let Some((user, repo)) = repo
-            .strip_prefix("github.com/")
-            .unwrap_or(&repo)
-            .rsplit_once('/')
-        else {
-            anyhow::bail!("invalid repo: `{repo}` (expected github.com/user/repo)")
+        // TODO: there's surely a better way to do this...
+        let cmd_out = cmd!(sh, "sh -c").arg(cmd).quiet().read();
+        if let Err(e) = cmd_out {
+            println!("encountered {e}, skipping");
+            return Ok(());
+        }
+        let cmd_out = cmd_out?;
+
+        context.commit(&format!("`sh -c {}`", cmd), Some(id))?;
+        let diff_out = match dry_run {
+            true => context.diff(id)?,
+            false => context.create_pr(Some(id), pr_info)?,
         };
-        println!("{repo}");
-        context.clone(user, repo)?;
-        {
-            let _guard = sh.push_dir(repo);
-            if let Err(e) = cmd!(sh, "sh -c").arg(cmd).quiet().run() {
-                println!("encountered {e}, skipping");
-                continue;
-            };
-            context.commit(&format!("`sh -c {}`", cmd), Some(id))?;
-            if !dry_run {
-                let pr_url = context.create_pr(Some(id), pr_info)?;
-                println!("{pr_url}");
-            } else {
-                let diff = context.diff(id)?;
-                println!("{diff}");
-            }
-        };
+
+        // minimize time with the lock, but lock to avoid clobbering between threads
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "{repo}")?;
+        writeln!(stdout, "{cmd_out}")?;
+        writeln!(stdout, "{diff_out}")?;
     }
     Ok(())
 }
@@ -98,16 +120,16 @@ impl<'a> Context<'a> {
         }
         let _guard = self.sh.push_dir(repo);
 
-        cmd!(
-            self.sh,
-            "git pull --force"
-        )
-        .quiet()
-        .ignore_stdout()
-        .ignore_stderr()
-        .run()?;
+        cmd!(self.sh, "git pull --force")
+            .quiet()
+            .ignore_stdout()
+            .ignore_stderr()
+            .run()?;
 
-        let branch = cmd!(self.sh, "git branch --show-current").quiet().ignore_stderr().read()?;
+        let branch = cmd!(self.sh, "git branch --show-current")
+            .quiet()
+            .ignore_stderr()
+            .read()?;
         if !matches!(branch.as_str(), "main" | "master") {
             anyhow::bail!("HEAD points to unexpected branch `{}`", branch);
         }

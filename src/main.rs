@@ -1,9 +1,9 @@
 mod git;
-use resolve_path::PathResolveExt;
 use clap::{Args, Parser, Subcommand};
 use clap_stdin::FileOrStdin;
 use git::{poor_mans_refactorator, tidy_merged_go_mod};
 use petname::Generator;
+use resolve_path::PathResolveExt;
 use std::io::BufReader;
 use std::path::PathBuf;
 
@@ -13,7 +13,7 @@ struct Cli {
     #[command(subcommand)]
     command: Commands,
 
-    #[arg(short='p', long)]
+    #[arg(short = 'p', long)]
     checkout_path: Option<PathBuf>,
 }
 
@@ -62,8 +62,9 @@ struct PrInfo {
 fn main() {
     let cli = Cli::parse();
 
-    let checkout_path = cli.checkout_path.unwrap_or("~/mono/".resolve().to_path_buf());
-    dbg!(&checkout_path);
+    let checkout_path = cli
+        .checkout_path
+        .unwrap_or("~/mono/".resolve().to_path_buf());
 
     match &cli.command {
         Commands::GoModMerge => tidy_merged_go_mod().expect("couldn't tidy go.mod / go.sum"),
