@@ -77,13 +77,24 @@ mod hackernews_tests {
     }
 }
 
+/// Based on this "ship of theseus" analysis of popular OSS projects, which estimates the half-life
+/// of a project to be ~3.3 years.
+///
+/// This is probably skewed (they studied popular, successful projects like git, rails, redis,
+/// django, node, etc), but it feels like a good place to start
+///
+/// https://raw.githubusercontent.com/erikbern/git-of-theseus/master/pics/git-projects-survival-exp-fit.png
+const ANNUAL_RATE: f64 = 0.23;
+
 pub struct InterestRate {
     rate: f64,
 }
 
 impl InterestRate {
-    pub fn new(rate: f64) -> Self {
-        InterestRate { rate }
+    /// rate is assumed to be the annual rate
+    pub fn new() -> Self {
+        // we adjust rate for our implicit (internal) period of compounding (weeks)
+        InterestRate { rate: ANNUAL_RATE / 52.0 }
     }
 }
 
@@ -105,7 +116,7 @@ impl Decay for InterestRate {
 
         let mut score = 0.0;
         for elt in elts {
-            let p = (now - elt).num_days().try_into().unwrap();
+            let p = (now - elt).num_weeks().try_into().unwrap();
             score += 1.0 / (1.0 + self.rate).powi(p)
         }
 
@@ -118,26 +129,26 @@ mod interestrate_tests {
 
     #[test]
     fn old_values_more_decayed() {
-        let today = InterestRate::new(0.05).decay(vec![chrono::offset::Utc::now()]);
-        let last_month = InterestRate::new(0.05)
+        let today = InterestRate::new().decay(vec![chrono::offset::Utc::now()]);
+        let last_month = InterestRate::new()
             .decay(vec![chrono::offset::Utc::now() - chrono::Months::new(1)]);
         assert!(last_month < today);
     }
 
     #[test]
     fn convergence() {
-        let old = InterestRate::new(0.05).decay(vec![chrono::offset::Utc::now() - chrono::Days::new(50)]);
-        let even_older = InterestRate::new(0.05).decay(vec![chrono::offset::Utc::now() - chrono::Days::new(51)]);
+        let old = InterestRate::new().decay(vec![chrono::offset::Utc::now() - chrono::Months::new(66)]);
+        let even_older = InterestRate::new().decay(vec![chrono::offset::Utc::now() - chrono::Months::new(67)]);
 
         assert!(old - even_older <= 0.005);
     }
 
     #[test]
     fn half_life() {
-        let today = InterestRate::new(0.05).decay(vec![chrono::offset::Utc::now()]);
-        let half_life = InterestRate::new(0.05)
-            .decay(vec![chrono::offset::Utc::now() - chrono::Days::new(14)]);
-        let ratio = dbg!(half_life / today);
+        let today = InterestRate::new().decay(vec![chrono::offset::Utc::now()]);
+        let half_life = InterestRate::new()
+            .decay(vec![chrono::offset::Utc::now() - chrono::Months::new(36)]);
+        let ratio = half_life / today;
 
         assert!(ratio <= 0.51);
         assert!(0.49 <= ratio);

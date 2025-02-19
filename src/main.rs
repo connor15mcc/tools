@@ -101,7 +101,7 @@ fn main() {
             .expect("couldn't create / update all PRs")
         }
         Commands::Decay => {
-            let score = score(InterestRate::new(0.05 / 12.0)).expect("couldn't calculate the score");
+            let score = score(InterestRate::new()).expect("couldn't calculate the score");
             println!("Decay score: {score:.2}")
         }
     }
