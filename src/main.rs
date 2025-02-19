@@ -1,4 +1,3 @@
-mod git;
 use clap::{Args, Parser, Subcommand};
 use clap_stdin::FileOrStdin;
 use git::{poor_mans_refactorator, tidy_merged_go_mod};
@@ -6,6 +5,9 @@ use petname::Generator;
 use resolve_path::PathResolveExt;
 use std::io::BufReader;
 use std::path::PathBuf;
+
+mod decay;
+mod git;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -21,6 +23,7 @@ struct Cli {
 enum Commands {
     GoModMerge,
     Pmr(PoorMansRefactorator),
+    Decay,
 }
 
 #[derive(Parser)]
@@ -95,6 +98,10 @@ fn main() {
                 &checkout_path,
             )
             .expect("couldn't create / update all PRs")
+        }
+        Commands::Decay => {
+            let score = decay::score(decay::HackerNews).expect("couldn't calculate the score");
+            println!("Decay score: {score:.2}")
         }
     }
 }
