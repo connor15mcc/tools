@@ -115,6 +115,7 @@ impl Decay for InterestRate {
 #[cfg(test)]
 mod interestrate_tests {
     use super::*;
+
     #[test]
     fn old_values_more_decayed() {
         let today = InterestRate::new(0.05).decay(vec![chrono::offset::Utc::now()]);
@@ -123,6 +124,22 @@ mod interestrate_tests {
         assert!(last_month < today);
     }
 
-    // TODO: should calculate (by hand) the convergence timeline for very old commits
-    // and use that in a test case
+    #[test]
+    fn convergence() {
+        let old = InterestRate::new(0.05).decay(vec![chrono::offset::Utc::now() - chrono::Days::new(50)]);
+        let even_older = InterestRate::new(0.05).decay(vec![chrono::offset::Utc::now() - chrono::Days::new(51)]);
+
+        assert!(old - even_older <= 0.005);
+    }
+
+    #[test]
+    fn half_life() {
+        let today = InterestRate::new(0.05).decay(vec![chrono::offset::Utc::now()]);
+        let half_life = InterestRate::new(0.05)
+            .decay(vec![chrono::offset::Utc::now() - chrono::Days::new(14)]);
+        let ratio = dbg!(half_life / today);
+
+        assert!(ratio <= 0.51);
+        assert!(0.49 <= ratio);
+    }
 }
