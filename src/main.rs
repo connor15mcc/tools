@@ -26,7 +26,7 @@ enum Commands {
     Pmr(PoorMansRefactorator),
     Decay {
         /// Rate with which to decay / depreciate older values (annual)
-        #[arg(short, long, required = false)]
+        #[arg(short, long)]
         rate: Option<f64>,
     },
 }
