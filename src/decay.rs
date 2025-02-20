@@ -92,11 +92,10 @@ pub struct InterestRate {
 
 impl InterestRate {
     /// rate is assumed to be the annual rate
-    pub fn new() -> Self {
+    pub fn new(rate: Option<f64>) -> Self {
         // we adjust rate for our implicit (internal) period of compounding (weeks)
-        InterestRate {
-            rate: ANNUAL_RATE / 52.0,
-        }
+        let rate = rate.unwrap_or(ANNUAL_RATE) / 52.0;
+        InterestRate { rate }
     }
 }
 
@@ -131,27 +130,27 @@ mod interestrate_tests {
 
     #[test]
     fn old_values_more_decayed() {
-        let today = InterestRate::new().decay(vec![chrono::offset::Utc::now()]);
+        let today = InterestRate::new(None).decay(vec![chrono::offset::Utc::now()]);
         let last_month =
-            InterestRate::new().decay(vec![chrono::offset::Utc::now() - chrono::Months::new(1)]);
+            InterestRate::new(None).decay(vec![chrono::offset::Utc::now() - chrono::Months::new(1)]);
         assert!(last_month < today);
     }
 
     #[test]
     fn convergence() {
         let old =
-            InterestRate::new().decay(vec![chrono::offset::Utc::now() - chrono::Months::new(66)]);
+            InterestRate::new(None).decay(vec![chrono::offset::Utc::now() - chrono::Months::new(66)]);
         let even_older =
-            InterestRate::new().decay(vec![chrono::offset::Utc::now() - chrono::Months::new(67)]);
+            InterestRate::new(None).decay(vec![chrono::offset::Utc::now() - chrono::Months::new(67)]);
 
         assert!(old - even_older <= 0.005);
     }
 
     #[test]
     fn half_life() {
-        let today = InterestRate::new().decay(vec![chrono::offset::Utc::now()]);
+        let today = InterestRate::new(None).decay(vec![chrono::offset::Utc::now()]);
         let half_life =
-            InterestRate::new().decay(vec![chrono::offset::Utc::now() - chrono::Months::new(36)]);
+            InterestRate::new(None).decay(vec![chrono::offset::Utc::now() - chrono::Months::new(36)]);
         let ratio = half_life / today;
 
         assert!(ratio <= 0.51);

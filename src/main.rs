@@ -24,7 +24,11 @@ struct Cli {
 enum Commands {
     GoModMerge,
     Pmr(PoorMansRefactorator),
-    Decay,
+    Decay {
+        /// Rate with which to decay / depreciate older values (annual)
+        #[arg(short, long, required = false)]
+        rate: Option<f64>,
+    },
 }
 
 #[derive(Parser)]
@@ -70,7 +74,7 @@ fn main() {
         .checkout_path
         .unwrap_or("~/mono/".resolve().to_path_buf());
 
-    match &cli.command {
+    match cli.command {
         Commands::GoModMerge => tidy_merged_go_mod().expect("couldn't tidy go.mod / go.sum"),
         Commands::Pmr(PoorMansRefactorator {
             id,
@@ -93,15 +97,15 @@ fn main() {
             poor_mans_refactorator(
                 &id,
                 pr_info.as_ref(),
-                *dry_run,
-                command,
+                dry_run,
+                &command,
                 reader,
                 &checkout_path,
             )
             .expect("couldn't create / update all PRs")
         }
-        Commands::Decay => {
-            let score = score(InterestRate::new()).expect("couldn't calculate the score");
+        Commands::Decay { rate } => {
+            let score = score(InterestRate::new(rate)).expect("couldn't calculate the score");
             println!("Decay score: {score:.2}")
         }
     }
