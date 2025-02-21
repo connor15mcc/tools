@@ -1,5 +1,5 @@
 use crate::PrInfo;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use git2::{build::CheckoutBuilder, Repository};
 use rayon::prelude::*;
 use std::io::BufRead;
@@ -43,7 +43,9 @@ pub fn poor_mans_refactorator(
 
     repos
         .par_iter()
-        .map(|repo| clone_and_do_work(id, pr_info, dry_run, cmd, repo, dir))
+        .map(|repo| {
+            clone_and_do_work(id, pr_info, dry_run, cmd, repo, dir).context("Couldn't clone {repo}")
+        })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(())
 }
