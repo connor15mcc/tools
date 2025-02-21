@@ -124,6 +124,7 @@ impl Decay for InterestRate {
         score
     }
 }
+
 #[cfg(test)]
 mod interestrate_tests {
     use super::*;
