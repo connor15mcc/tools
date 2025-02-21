@@ -15,9 +15,6 @@ mod git;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
-
-    #[arg(short = 'p', long)]
-    checkout_path: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -50,6 +47,9 @@ struct PoorMansRefactorator {
     #[arg(required = true)]
     command: String,
 
+    #[arg(short = 'p', long)]
+    checkout_path: Option<PathBuf>,
+
     /// File from which to read, new-line separated
     #[clap(default_value = "-")]
     repos_file: FileOrStdin,
@@ -70,10 +70,6 @@ struct PrInfo {
 fn main() {
     let cli = Cli::parse();
 
-    let checkout_path = cli
-        .checkout_path
-        .unwrap_or("~/mono/".resolve().to_path_buf());
-
     match cli.command {
         Commands::GoModMerge => tidy_merged_go_mod().expect("couldn't tidy go.mod / go.sum"),
         Commands::Pmr(PoorMansRefactorator {
@@ -81,6 +77,7 @@ fn main() {
             pr_info,
             dry_run,
             command,
+            checkout_path,
             repos_file,
         }) => {
             let id = id.to_owned().unwrap_or_else(|| {
@@ -94,6 +91,7 @@ fn main() {
                     .into_reader()
                     .expect("failed to convert to reader"),
             );
+            let checkout_path = checkout_path.unwrap_or("~/mono/".resolve().to_path_buf());
             poor_mans_refactorator(
                 &id,
                 pr_info.as_ref(),
