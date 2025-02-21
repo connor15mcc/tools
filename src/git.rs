@@ -44,7 +44,8 @@ pub fn poor_mans_refactorator(
     repos
         .par_iter()
         .map(|repo| {
-            clone_and_do_work(id, pr_info, dry_run, cmd, repo, dir).context("Couldn't clone {repo}")
+            clone_and_do_work(id, pr_info, dry_run, cmd, repo, dir)
+                .with_context(|| format!("Couldn't clone {repo}"))
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(())
@@ -69,7 +70,7 @@ fn clone_and_do_work(
     let context = Context { sh: &sh };
     let Some((user, repo)) = repo
         .strip_prefix("github.com/")
-        .unwrap_or(&repo)
+        .unwrap_or(repo)
         .rsplit_once('/')
     else {
         anyhow::bail!("invalid repo: `{repo}` (expected github.com/user/repo)")
@@ -105,7 +106,7 @@ struct Context<'a> {
     sh: &'a Shell,
 }
 
-impl<'a> Context<'a> {
+impl Context<'_> {
     fn clone(&self, user: &str, repo: &str) -> Result<()> {
         let dotgit_exists = self
             .sh
