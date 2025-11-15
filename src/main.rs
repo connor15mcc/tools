@@ -26,6 +26,7 @@ enum Commands {
         #[arg(short, long)]
         rate: Option<f64>,
     },
+    Petname,
 }
 
 #[derive(Parser)]
@@ -105,6 +106,12 @@ fn main() {
         Commands::Decay { rate } => {
             let score = score(InterestRate::new(rate)).expect("couldn't calculate the score");
             println!("Decay score: {score:.2}")
+        }
+        Commands::Petname => {
+            let name = petname::Petnames::default()
+                .generate_one(2, "-")
+                .expect("couldn't generate name");
+            println!("{}", name);
         }
     }
 }
