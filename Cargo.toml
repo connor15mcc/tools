@@ -8,6 +8,8 @@ anyhow = "1.0.95"
 chrono = "0.4.39"
 clap = { version = "4.5.26", features = ["derive"] }
 clap-stdin = "0.6.0"
+crossterm = "0.27"
+ctrlc = "3.4"
 dateparser = "0.2.1"
 git2 = "0.20.0"
 petname = "2.0.2"

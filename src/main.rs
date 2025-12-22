@@ -2,6 +2,7 @@ use clap::{Args, Parser, Subcommand};
 use clap_stdin::FileOrStdin;
 use decay::*;
 use git::{poor_mans_refactorator, tidy_merged_go_mod};
+use ilimit::interactive_tail;
 use petname::Generator;
 use resolve_path::PathResolveExt;
 use std::io::BufReader;
@@ -9,6 +10,7 @@ use std::path::PathBuf;
 
 mod decay;
 mod git;
+mod ilimit;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -27,6 +29,7 @@ enum Commands {
         rate: Option<f64>,
     },
     Petname,
+    Ilimit(IlimitCommand),
 }
 
 #[derive(Parser)]
@@ -66,6 +69,17 @@ struct PrInfo {
     /// Body to use for newly-created PRs
     #[arg(short, long, required = false)]
     body: String,
+}
+
+#[derive(Parser)]
+struct IlimitCommand {
+    /// Number of lines to display from the end of input
+    #[arg(long, default_value_t = 10)]
+    limit: usize,
+
+    /// File from which to read, defaulting to stdin
+    #[clap(default_value = "-")]
+    input: FileOrStdin,
 }
 
 fn main() {
@@ -112,6 +126,10 @@ fn main() {
                 .generate_one(2, "-")
                 .expect("couldn't generate name");
             println!("{}", name);
+        }
+        Commands::Ilimit(IlimitCommand { limit, input }) => {
+            let reader = input.into_reader().expect("failed to convert to reader");
+            interactive_tail(reader, limit).expect("failed to tail input");
         }
     }
 }
