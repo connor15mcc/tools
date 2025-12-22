@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use clap_stdin::FileOrStdin;
 use decay::*;
 use git::{poor_mans_refactorator, tidy_merged_go_mod};
@@ -13,14 +13,15 @@ mod git;
 mod ilimit;
 
 #[derive(Parser)]
-#[command(version, about, long_about = None)]
+#[command(version, about, long_about = None, arg_required_else_help = true)]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    Tools(ToolsCommand),
     GoModMerge,
     Pmr(PoorMansRefactorator),
     Decay {
@@ -30,6 +31,15 @@ enum Commands {
     },
     Petname,
     Ilimit(IlimitCommand),
+}
+
+#[derive(Parser)]
+#[command(about = "personal tools binary manager")]
+#[command(arg_required_else_help = true)]
+struct ToolsCommand {
+    /// Create symlinks for all commands (in the same directory as this binary)
+    #[arg(long)]
+    install: bool,
 }
 
 #[derive(Parser)]
@@ -82,10 +92,61 @@ struct IlimitCommand {
     input: FileOrStdin,
 }
 
-fn main() {
-    let cli = Cli::parse();
+fn install_symlinks() -> anyhow::Result<()> {
+    let exe_path = std::env::current_exe()?;
+    let exe_dir = exe_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine binary directory"))?;
+    let exe_name = exe_path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine binary name"))?;
 
-    match cli.command {
+    let cmd = Cli::command();
+    let commands: Vec<String> = cmd
+        .get_subcommands()
+        .filter(|sc| {
+            let name = sc.get_name();
+            name != "help" && name != "tools"
+        })
+        .map(|sc| sc.get_name().to_string())
+        .collect();
+
+    for cmd_name in &commands {
+        let link_path = exe_dir.join(cmd_name);
+
+        // Remove existing symlink/file if it exists
+        if link_path.exists() || link_path.symlink_metadata().is_ok() {
+            std::fs::remove_file(&link_path)?;
+        }
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(exe_name, &link_path)?;
+
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(exe_name, &link_path)?;
+
+        eprintln!("created symlink: {}", link_path.display());
+    }
+
+    Ok(())
+}
+
+fn main() {
+    let cmd = Cli::command().multicall(true);
+    let matches = cmd.get_matches();
+
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+
+    let Some(command) = cli.command else {
+        unreachable!("clap should require a command");
+    };
+
+    match command {
+        Commands::Tools(ToolsCommand { install }) => {
+            if install {
+                install_symlinks().expect("Failed to install symlinks");
+            }
+        }
         Commands::GoModMerge => tidy_merged_go_mod().expect("couldn't tidy go.mod / go.sum"),
         Commands::Pmr(PoorMansRefactorator {
             id,
@@ -102,7 +163,6 @@ fn main() {
             });
             let reader = BufReader::new(
                 repos_file
-                    .clone()
                     .into_reader()
                     .expect("failed to convert to reader"),
             );
