@@ -53,15 +53,23 @@ fn find_commands_in_file(path: &Path) -> Result<Vec<String>, Box<dyn std::error:
 
     let mut command_structs = Vec::new();
 
-    // Find all structs that derive Parser
+    // Find all structs and enums that derive Parser
     let parser_structs: Vec<String> = ast
         .items
         .iter()
         .filter_map(|item| {
-            if let Item::Struct(s) = item {
-                if has_parser_derive(&s) {
-                    return Some(s.ident.to_string());
+            match item {
+                Item::Struct(s) => {
+                    if has_parser_derive_struct(s) {
+                        return Some(s.ident.to_string());
+                    }
                 }
+                Item::Enum(e) => {
+                    if has_parser_derive_enum(e) {
+                        return Some(e.ident.to_string());
+                    }
+                }
+                _ => {}
             }
             None
         })
@@ -112,8 +120,25 @@ fn find_commands_in_file(path: &Path) -> Result<Vec<String>, Box<dyn std::error:
     Ok(command_structs)
 }
 
-fn has_parser_derive(s: &ItemStruct) -> bool {
+fn has_parser_derive_struct(s: &ItemStruct) -> bool {
     s.attrs.iter().any(|attr| {
+        if attr.path().is_ident("derive") {
+            if let Ok(list) = attr.parse_args_with(
+                syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
+            ) {
+                return list.iter().any(|path| {
+                    path.segments
+                        .last()
+                        .is_some_and(|seg| seg.ident == "Parser")
+                });
+            }
+        }
+        false
+    })
+}
+
+fn has_parser_derive_enum(e: &syn::ItemEnum) -> bool {
+    e.attrs.iter().any(|attr| {
         if attr.path().is_ident("derive") {
             if let Ok(list) = attr.parse_args_with(
                 syn::punctuated::Punctuated::<syn::Path, syn::Token![,]>::parse_terminated,
