@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::Command as ClapCommand;
+use clap::{Arg, ArgAction, Command as ClapCommand};
 
 mod command;
 mod commands;
@@ -13,13 +13,32 @@ fn main() -> Result<()> {
         .multicall(true)
         .arg_required_else_help(true);
 
-    // Add all commands as subcommands
+    // Add all commands as subcommands, adding verbose flag to each
+    // Note: We add the verbose flag to each subcommand individually because
+    // clap's multicall mode doesn't support global arguments. This ensures
+    // all subcommands have consistent -v/--verbose support for logging.
     for cmd in COMMANDS.iter() {
-        app = app.subcommand(cmd.command());
+        let subcommand = cmd.command().arg(
+            Arg::new("verbose")
+                .short('v')
+                .long("verbose")
+                .help("Increase logging verbosity (-v, -vv, -vvv)")
+                .action(ArgAction::Count)
+                .global(false),
+        );
+        app = app.subcommand(subcommand);
     }
 
     let matches = app.get_matches();
     let (subcmd_name, sub_matches) = matches.subcommand().expect("clap should ensure subcommand");
+
+    // Initialize logging with verbosity from the subcommand matches
+    let verbosity = sub_matches.get_count("verbose") as usize;
+    stderrlog::new()
+        .verbosity(verbosity)
+        .module(module_path!())
+        .init()
+        .unwrap();
 
     // Find and execute the matching command
     for cmd in COMMANDS.iter() {

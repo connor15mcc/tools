@@ -1,6 +1,7 @@
 use crate::command::CommandRunner;
 use anyhow::{Context, Result};
 use clap::Parser;
+use log::{debug, info};
 use std::fs::File;
 use std::io::Write;
 use std::process::Command;
@@ -22,6 +23,8 @@ impl CommandRunner for Review {
     fn run(self) -> Result<()> {
         let sh = Shell::new()?;
         let query = self.query.join(" ");
+
+        debug!("Searching for PRs with query: '{}'", query);
 
         // Search for PRs using gh search prs
         // Pass each query term as a separate argument for proper parsing
@@ -46,6 +49,8 @@ impl CommandRunner for Review {
             return Ok(());
         }
 
+        debug!("Found {} PRs to review", prs.len());
+
         // Create temp files for each PR diff
         let temp_dir = std::env::temp_dir();
         let mut temp_files = Vec::new();
@@ -56,6 +61,8 @@ impl CommandRunner for Review {
                 pr.repository.name_with_owner.replace('/', "-"),
                 pr.number
             ));
+
+            info!("Fetching diff for PR #{}: {}", pr.number, pr.title);
 
             // Fetch the diff
             let diff = cmd!(sh, "gh pr diff")
