@@ -12,7 +12,13 @@ crossterm = "0.27"
 ctrlc = "3.4"
 dateparser = "0.2.1"
 git2 = "0.20.0"
+linkme = "0.3"
 petname = "2.0.2"
 rayon = "1.10.0"
 resolve-path = "0.1.0"
 xshell = "0.2.7"
+
+[build-dependencies]
+syn = { version = "2", features = ["full", "parsing"] }
+quote = "1"
+indoc = "2"

@@ -1,3 +1,6 @@
+use crate::command::CommandRunner;
+use clap::Parser;
+use clap_stdin::FileOrStdin;
 use crossterm::{
     cursor,
     terminal::{self, ClearType},
@@ -6,7 +9,34 @@ use crossterm::{
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 
-pub fn interactive_tail<R: Read>(reader: R, limit: usize) -> std::io::Result<()> {
+#[derive(Parser)]
+#[command(
+    name = "ilimit",
+    about = "Interactively tail a limited number of lines"
+)]
+pub struct Ilimit {
+    /// Number of lines to display from the end of input
+    #[arg(long, default_value_t = 10)]
+    limit: usize,
+
+    /// File from which to read, defaulting to stdin
+    #[clap(default_value = "-")]
+    input: FileOrStdin,
+}
+
+impl CommandRunner for Ilimit {
+    fn run(self) -> anyhow::Result<()> {
+        let reader = self
+            .input
+            .clone()
+            .into_reader()
+            .expect("failed to convert to reader");
+        interactive_tail(reader, self.limit)?;
+        Ok(())
+    }
+}
+
+fn interactive_tail<R: Read>(reader: R, limit: usize) -> std::io::Result<()> {
     let mut buffer = VecDeque::with_capacity(limit);
     let buf_reader = BufReader::new(reader);
     let mut stdout = std::io::stdout();
@@ -20,8 +50,7 @@ pub fn interactive_tail<R: Read>(reader: R, limit: usize) -> std::io::Result<()>
         std::process::exit(130); // Exit code 128 + SIGINT(2) = 130
     })
     .map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
+        std::io::Error::other(
             format!("Failed to set Ctrl-C handler: {}", e),
         )
     })?;

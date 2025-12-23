@@ -1,37 +1,91 @@
-use crate::PrInfo;
+use crate::command::CommandRunner;
 use anyhow::{Context as _, Result};
-use git2::{build::CheckoutBuilder, Repository};
+use clap::{Args, Parser};
+use clap_stdin::FileOrStdin;
+use petname::Generator;
 use rayon::prelude::*;
+use resolve_path::PathResolveExt;
 use std::io::BufRead;
+use std::io::BufReader;
 use std::io::Read;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::{io::BufReader, process::Command};
 use xshell::{cmd, Shell};
 
-pub fn tidy_merged_go_mod() -> Result<()> {
-    let cwd = std::env::current_dir()?;
-    let repo = Repository::open(&cwd)?;
-    repo.checkout_index(
-        None,
-        Some(
-            CheckoutBuilder::default()
-                .use_ours(true)
-                .path("go.mod")
-                .path("go.sum")
-                .force(),
-        ),
-    )?;
+#[derive(Parser)]
+#[command(
+    name = "pmr",
+    about = "Poor Man's Refactorator - batch apply changes across repos"
+)]
+pub struct PmrCommand {
+    /// ID of this upsert "idea" (to enable re-using PRs)
+    #[arg(short, long)]
+    id: Option<String>,
 
-    Command::new("go")
-        .args(["mod", "tidy"])
-        .current_dir(&cwd)
-        .output()?;
+    #[clap(flatten)]
+    pr_info: Option<PrInfo>,
 
-    Ok(())
+    /// True to skip creating a PR and instead print a diff summary to stdout
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Command that will be invoked on each repo, with the resulting changes
+    /// applied in a commit + put for review
+    #[arg(required = true)]
+    command: String,
+
+    #[arg(short = 'p', long)]
+    checkout_path: Option<PathBuf>,
+
+    /// File from which to read, new-line separated
+    #[clap(default_value = "-")]
+    repos_file: FileOrStdin,
 }
 
-pub fn poor_mans_refactorator(
+#[derive(Args, Debug, Clone)]
+#[group(requires_all = ["title", "body"])]
+pub struct PrInfo {
+    /// Title to use for newly-created PRs
+    #[arg(short, long, required = false)]
+    pub title: String,
+
+    /// Body to use for newly-created PRs
+    #[arg(short, long, required = false)]
+    pub body: String,
+}
+
+impl CommandRunner for PmrCommand {
+    fn run(self) -> Result<()> {
+        let id = self.id.clone().unwrap_or_else(|| {
+            petname::Petnames::default()
+                .generate_one(2, "-")
+                .expect("couldn't generate RNG name")
+        });
+
+        let reader = BufReader::new(
+            self.repos_file
+                .clone()
+                .into_reader()
+                .expect("failed to convert to reader"),
+        );
+
+        let checkout_path = self
+            .checkout_path
+            .clone()
+            .unwrap_or("~/mono/".resolve().to_path_buf());
+
+        poor_mans_refactorator(
+            &id,
+            self.pr_info.as_ref(),
+            self.dry_run,
+            &self.command,
+            reader,
+            &checkout_path,
+        )
+    }
+}
+
+fn poor_mans_refactorator(
     id: &str,
     pr_info: Option<&PrInfo>,
     dry_run: bool,
@@ -65,8 +119,6 @@ fn clone_and_do_work(
     }
     sh.change_dir(dir);
 
-    // TODO: figure out tracing, tmp path (should be logged in some way)
-
     let context = Context { sh: &sh };
     let Some((user, repo)) = repo
         .strip_prefix("github.com/")
@@ -79,7 +131,6 @@ fn clone_and_do_work(
     {
         let _guard = sh.push_dir(repo);
 
-        // TODO: there's surely a better way to do this...
         let cmd_out = cmd!(sh, "sh -c").arg(cmd).quiet().read();
         if let Err(e) = cmd_out {
             println!("encountered {e}, skipping");
@@ -176,7 +227,6 @@ impl Context<'_> {
         Ok(())
     }
 
-    // TODO: support title and body
     fn create_pr(&self, branch: Option<&str>, pr_info: Option<&PrInfo>) -> Result<String> {
         if let Some(branch) = branch {
             cmd!(self.sh, "git switch {branch}")

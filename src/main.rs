@@ -1,195 +1,33 @@
-use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
-use clap_stdin::FileOrStdin;
-use decay::*;
-use git::{poor_mans_refactorator, tidy_merged_go_mod};
-use ilimit::interactive_tail;
-use petname::Generator;
-use resolve_path::PathResolveExt;
-use std::io::BufReader;
-use std::path::PathBuf;
+use anyhow::Result;
+use clap::Command as ClapCommand;
 
-mod decay;
-mod git;
-mod ilimit;
+mod command;
+mod commands;
 
-#[derive(Parser)]
-#[command(version, about, long_about = None, arg_required_else_help = true)]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Commands>,
-}
+use command::COMMANDS;
 
-#[derive(Subcommand)]
-enum Commands {
-    Tools(ToolsCommand),
-    GoModMerge,
-    Pmr(PoorMansRefactorator),
-    Decay {
-        /// Rate with which to decay / depreciate older values (annual)
-        #[arg(short, long)]
-        rate: Option<f64>,
-    },
-    Petname,
-    Ilimit(IlimitCommand),
-}
+fn main() -> Result<()> {
+    let mut app = ClapCommand::new("tools")
+        .version(env!("CARGO_PKG_VERSION"))
+        .about("personal tools binary manager")
+        .multicall(true)
+        .arg_required_else_help(true);
 
-#[derive(Parser)]
-#[command(about = "personal tools binary manager")]
-#[command(arg_required_else_help = true)]
-struct ToolsCommand {
-    /// Create symlinks for all commands (in the same directory as this binary)
-    #[arg(long)]
-    install: bool,
-}
-
-#[derive(Parser)]
-#[command(version, about, long_about = None)]
-struct PoorMansRefactorator {
-    /// ID of this upsert "idea" (to enable re-using PRs)
-    #[arg(short, long)]
-    id: Option<String>,
-
-    #[clap(flatten)]
-    pr_info: Option<PrInfo>,
-
-    /// True to skip creating a PR and instead print a diff summary to stdout
-    #[arg(long)]
-    dry_run: bool,
-
-    /// Command that will be invoked on each repo, with the resulting changes
-    /// applied in a commit + put for review
-    #[arg(required = true)]
-    command: String,
-
-    #[arg(short = 'p', long)]
-    checkout_path: Option<PathBuf>,
-
-    /// File from which to read, new-line separated
-    #[clap(default_value = "-")]
-    repos_file: FileOrStdin,
-}
-
-#[derive(Args, Debug)]
-#[group(requires_all = ["title", "body"])] // https://github.com/clap-rs/clap/issues/5092
-struct PrInfo {
-    /// Title to use for newly-created PRs
-    #[arg(short, long, required = false)]
-    title: String,
-
-    /// Body to use for newly-created PRs
-    #[arg(short, long, required = false)]
-    body: String,
-}
-
-#[derive(Parser)]
-struct IlimitCommand {
-    /// Number of lines to display from the end of input
-    #[arg(long, default_value_t = 10)]
-    limit: usize,
-
-    /// File from which to read, defaulting to stdin
-    #[clap(default_value = "-")]
-    input: FileOrStdin,
-}
-
-fn install_symlinks() -> anyhow::Result<()> {
-    let exe_path = std::env::current_exe()?;
-    let exe_dir = exe_path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Could not determine binary directory"))?;
-    let exe_name = exe_path
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("Could not determine binary name"))?;
-
-    let cmd = Cli::command();
-    let commands: Vec<String> = cmd
-        .get_subcommands()
-        .filter(|sc| {
-            let name = sc.get_name();
-            name != "help" && name != "tools"
-        })
-        .map(|sc| sc.get_name().to_string())
-        .collect();
-
-    for cmd_name in &commands {
-        let link_path = exe_dir.join(cmd_name);
-
-        // Remove existing symlink/file if it exists
-        if link_path.exists() || link_path.symlink_metadata().is_ok() {
-            std::fs::remove_file(&link_path)?;
-        }
-
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(exe_name, &link_path)?;
-
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_file(exe_name, &link_path)?;
-
-        eprintln!("created symlink: {}", link_path.display());
+    // Add all commands as subcommands
+    for cmd in COMMANDS.iter() {
+        app = app.subcommand(cmd.command());
     }
 
-    Ok(())
-}
+    let matches = app.get_matches();
+    let (subcmd_name, sub_matches) = matches.subcommand().expect("clap should ensure subcommand");
 
-fn main() {
-    let cmd = Cli::command().multicall(true);
-    let matches = cmd.get_matches();
-
-    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
-
-    let Some(command) = cli.command else {
-        unreachable!("clap should require a command");
-    };
-
-    match command {
-        Commands::Tools(ToolsCommand { install }) => {
-            if install {
-                install_symlinks().expect("Failed to install symlinks");
-            }
-        }
-        Commands::GoModMerge => tidy_merged_go_mod().expect("couldn't tidy go.mod / go.sum"),
-        Commands::Pmr(PoorMansRefactorator {
-            id,
-            pr_info,
-            dry_run,
-            command,
-            checkout_path,
-            repos_file,
-        }) => {
-            let id = id.to_owned().unwrap_or_else(|| {
-                petname::Petnames::default()
-                    .generate_one(2, "-")
-                    .expect("couldn't generate RNG name")
-            });
-            let reader = BufReader::new(
-                repos_file
-                    .into_reader()
-                    .expect("failed to convert to reader"),
-            );
-            let checkout_path = checkout_path.unwrap_or("~/mono/".resolve().to_path_buf());
-            poor_mans_refactorator(
-                &id,
-                pr_info.as_ref(),
-                dry_run,
-                &command,
-                reader,
-                &checkout_path,
-            )
-            .expect("couldn't create / update all PRs")
-        }
-        Commands::Decay { rate } => {
-            let score = score(InterestRate::new(rate)).expect("couldn't calculate the score");
-            println!("Decay score: {score:.2}")
-        }
-        Commands::Petname => {
-            let name = petname::Petnames::default()
-                .generate_one(2, "-")
-                .expect("couldn't generate name");
-            println!("{}", name);
-        }
-        Commands::Ilimit(IlimitCommand { limit, input }) => {
-            let reader = input.into_reader().expect("failed to convert to reader");
-            interactive_tail(reader, limit).expect("failed to tail input");
+    // Find and execute the matching command
+    for cmd in COMMANDS.iter() {
+        let command = cmd.command();
+        if command.get_name() == subcmd_name {
+            return cmd.execute_from_matches(sub_matches);
         }
     }
+
+    unreachable!("clap should only match registered subcommands")
 }
