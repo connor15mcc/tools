@@ -288,10 +288,15 @@ fn create_temp_note() -> anyhow::Result<()> {
 
     println!("Creating temporary note: {}", path.display());
 
-    std::fs::write(&path, "")
-        .with_context(|| format!("Failed to create temp note: {}", path.display()))?;
+    let editor = get_editor()?;
+    let status = std::process::Command::new(&editor)
+        .arg(&path)
+        .status()
+        .with_context(|| format!("Failed to launch editor: {}", editor))?;
 
-    edit_note(&notes_dir, &path)?;
+    if !status.success() {
+        anyhow::bail!("Editor exited with non-zero status: {}", status);
+    }
 
     Ok(())
 }
