@@ -1,6 +1,6 @@
 use std::{
-    collections::{hash_map::DefaultHasher, HashMap},
-    hash::{Hash, Hasher},
+    collections::HashMap,
+    fmt,
     io::{BufRead, BufReader, Read, Write},
     time::{Duration, Instant},
 };
@@ -14,6 +14,33 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use regex::Regex;
 
 use crate::command::CommandRunner;
+
+/// Wraps an RNG with its seed for reproducibility
+struct SeededRng {
+    seed: u64,
+    rng: StdRng,
+}
+
+impl SeededRng {
+    fn new(seed: u64) -> Self {
+        SeededRng {
+            seed,
+            rng: StdRng::seed_from_u64(seed),
+        }
+    }
+
+    fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    // Allow mutable access to the inner RNG for gen() operations
+    fn gen<T>(&mut self) -> T
+    where
+        rand::distributions::Standard: rand::distributions::Distribution<T>,
+    {
+        self.rng.gen()
+    }
+}
 
 fn validate_rate(s: &str) -> Result<f64, String> {
     let val: f64 = s
@@ -41,14 +68,6 @@ fn extract_stratum_key(line: &str, regex: &Regex) -> String {
         .find(line)
         .map(|m| m.as_str().to_string())
         .unwrap_or_else(|| "unmatched".to_string())
-}
-
-/// Derive a deterministic seed for a stratum from base seed + stratum key
-fn derive_seed(base_seed: u64, stratum_key: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    base_seed.hash(&mut hasher);
-    stratum_key.hash(&mut hasher);
-    hasher.finish()
 }
 
 #[derive(Parser)]
@@ -92,157 +111,607 @@ pub struct Sample {
 }
 
 #[derive(Debug, Clone)]
+struct StrategyDetails {
+    name: String,
+    parameters: HashMap<String, String>,
+    seed: Option<u64>,
+    expectations: HashMap<String, String>,
+    stratum_stats: Option<HashMap<String, StratumStats>>,
+}
+
+impl fmt::Display for StrategyDetails {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "{}", self.name)?;
+
+        if !self.parameters.is_empty() {
+            let params: Vec<String> = self
+                .parameters
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect();
+            writeln!(f, "  parameters: {}", params.join(", "))?;
+        }
+
+        if let Some(seed) = self.seed {
+            writeln!(f, "  seed: {}", seed)?;
+        }
+
+        if !self.expectations.is_empty() {
+            writeln!(f, "expectations:")?;
+            for (key, value) in &self.expectations {
+                writeln!(f, "  {}: {}", key, value)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Trait for streaming sampling decisions
+trait StreamingStrategy {
+    type State;
+
+    fn init_state(&self, rng: StdRng) -> Self::State;
+    fn should_sample(&self, state: &mut Self::State, line: &str) -> bool;
+    fn format_details(&self) -> StrategyDetails;
+}
+
+struct ProcessResult {
+    sampled: bool,
+}
+
+trait StreamingSampler {
+    fn process_line(&mut self, line: &str) -> ProcessResult;
+    fn format_details(&self) -> StrategyDetails;
+}
+
+/// Trait for batch sampling strategies (two-phase: collect then finalize)
+trait BatchStrategy {
+    type State;
+
+    fn init_state(&self, rng: StdRng) -> Self::State;
+    fn add_line(&self, state: &mut Self::State, line: String);
+    fn finalize(&self, state: Self::State) -> Vec<(usize, String)>;
+    fn format_details(&self) -> StrategyDetails;
+}
+
+trait BatchSampler {
+    /// Collect a single line, returning stratum key if stratified
+    fn collect_line(&mut self, line: String) -> Option<String>;
+
+    /// Finalize processing and return selected lines with StrategyDetails
+    /// Returns (selected lines, strategy details with stats)
+    fn finalize(self: Box<Self>) -> (Vec<(Option<String>, String)>, StrategyDetails);
+}
+
+struct UniformStreamSampler<S: StreamingStrategy> {
+    strategy: S,
+    state: S::State,
+    seed: u64,
+}
+
+impl<S: StreamingStrategy> UniformStreamSampler<S> {
+    fn new(strategy: S, seeded_rng: SeededRng) -> Self {
+        let seed = seeded_rng.seed();
+        let state = strategy.init_state(seeded_rng.rng);
+        UniformStreamSampler {
+            strategy,
+            state,
+            seed,
+        }
+    }
+}
+
+impl<S: StreamingStrategy> StreamingSampler for UniformStreamSampler<S> {
+    fn process_line(&mut self, line: &str) -> ProcessResult {
+        let sampled = self.strategy.should_sample(&mut self.state, line);
+        ProcessResult { sampled }
+    }
+
+    fn format_details(&self) -> StrategyDetails {
+        let mut details = self.strategy.format_details();
+        details.seed = Some(self.seed);
+        details
+    }
+}
+
+struct StratifiedStreamSampler<S: StreamingStrategy> {
+    strategy: S,
+    regex: Regex,
+    stratum_states: HashMap<String, S::State>,
+    stratum_stats: HashMap<String, StratumStats>,
+    base_rng: SeededRng,
+}
+
+impl<S: StreamingStrategy> StratifiedStreamSampler<S> {
+    fn new(strategy: S, regex: Regex, seeded_rng: SeededRng) -> Self {
+        StratifiedStreamSampler {
+            strategy,
+            regex,
+            stratum_states: HashMap::new(),
+            stratum_stats: HashMap::new(),
+            base_rng: seeded_rng,
+        }
+    }
+}
+
+impl<S: StreamingStrategy> StreamingSampler for StratifiedStreamSampler<S> {
+    fn process_line(&mut self, line: &str) -> ProcessResult {
+        let key = extract_stratum_key(line, &self.regex);
+
+        self.stratum_stats
+            .entry(key.clone())
+            .or_insert(StratumStats {
+                lines_read: 0,
+                lines_output: 0,
+            })
+            .lines_read += 1;
+
+        let state = self.stratum_states.entry(key.clone()).or_insert_with(|| {
+            let stratum_seed = self.base_rng.gen::<u64>();
+            let stratum_rng = StdRng::seed_from_u64(stratum_seed);
+            self.strategy.init_state(stratum_rng)
+        });
+        let sampled = self.strategy.should_sample(state, line);
+
+        if sampled {
+            self.stratum_stats.get_mut(&key).unwrap().lines_output += 1;
+        }
+
+        ProcessResult { sampled }
+    }
+
+    fn format_details(&self) -> StrategyDetails {
+        let mut details = self.strategy.format_details();
+        details.name = format!("{} (stratified by {})", details.name, self.regex.as_str());
+        details.stratum_stats = Some(self.stratum_stats.clone());
+        details.seed = Some(self.base_rng.seed());
+        details
+    }
+}
+
+struct UniformBatchSampler<S: BatchStrategy> {
+    strategy: S,
+    state: S::State,
+    seed: u64,
+}
+
+impl<S: BatchStrategy> UniformBatchSampler<S> {
+    fn new(strategy: S, seeded_rng: SeededRng) -> Self {
+        let seed = seeded_rng.seed();
+        let state = strategy.init_state(seeded_rng.rng);
+        UniformBatchSampler {
+            strategy,
+            state,
+            seed,
+        }
+    }
+}
+
+impl<S: BatchStrategy> BatchSampler for UniformBatchSampler<S> {
+    fn collect_line(&mut self, line: String) -> Option<String> {
+        self.strategy.add_line(&mut self.state, line);
+        None // Non-stratified
+    }
+
+    fn finalize(self: Box<Self>) -> (Vec<(Option<String>, String)>, StrategyDetails) {
+        let selected = self.strategy.finalize(self.state);
+        let result: Vec<(Option<String>, String)> = selected
+            .into_iter()
+            .map(|(_idx, line)| (None, line))
+            .collect();
+        let mut details = self.strategy.format_details();
+        details.seed = Some(self.seed);
+        (result, details)
+    }
+}
+
+struct StratifiedBatchSampler<S: BatchStrategy> {
+    strategy: S,
+    regex: Regex,
+    stratum_states: HashMap<String, S::State>,
+    line_to_stratum: Vec<String>,
+    stratum_stats: HashMap<String, StratumStats>,
+    base_rng: SeededRng,
+}
+
+impl<S: BatchStrategy> StratifiedBatchSampler<S> {
+    fn new(strategy: S, regex: Regex, seeded_rng: SeededRng) -> Self {
+        StratifiedBatchSampler {
+            strategy,
+            regex,
+            stratum_states: HashMap::new(),
+            line_to_stratum: Vec::new(),
+            stratum_stats: HashMap::new(),
+            base_rng: seeded_rng,
+        }
+    }
+}
+
+impl<S: BatchStrategy> BatchSampler for StratifiedBatchSampler<S> {
+    fn collect_line(&mut self, line: String) -> Option<String> {
+        let key = extract_stratum_key(&line, &self.regex);
+        self.line_to_stratum.push(key.clone());
+
+        self.stratum_stats
+            .entry(key.clone())
+            .or_insert(StratumStats {
+                lines_read: 0,
+                lines_output: 0,
+            })
+            .lines_read += 1;
+
+        let state = self.stratum_states.entry(key.clone()).or_insert_with(|| {
+            let stratum_seed = self.base_rng.gen::<u64>();
+            let stratum_rng = StdRng::seed_from_u64(stratum_seed);
+            self.strategy.init_state(stratum_rng)
+        });
+
+        self.strategy.add_line(state, line);
+        Some(key)
+    }
+
+    fn finalize(self: Box<Self>) -> (Vec<(Option<String>, String)>, StrategyDetails) {
+        let mut stratum_to_global_indices: HashMap<String, Vec<usize>> = HashMap::new();
+        for (global_idx, stratum_key) in self.line_to_stratum.iter().enumerate() {
+            stratum_to_global_indices
+                .entry(stratum_key.clone())
+                .or_default()
+                .push(global_idx);
+        }
+
+        let mut selected: Vec<(usize, String, String)> = Vec::new();
+        let mut stratum_stats = self.stratum_stats;
+
+        for (stratum_key, state) in self.stratum_states {
+            let stratum_selected = self.strategy.finalize(state);
+            let global_indices = &stratum_to_global_indices[&stratum_key];
+
+            stratum_stats.get_mut(&stratum_key).unwrap().lines_output += stratum_selected.len();
+
+            for (within_idx, line) in stratum_selected {
+                let global_idx = global_indices[within_idx];
+                selected.push((global_idx, line, stratum_key.clone()));
+            }
+        }
+
+        selected.sort_by_key(|(idx, ..)| *idx);
+
+        let mut details = self.strategy.format_details();
+        details.name = format!("{} (stratified by {})", details.name, self.regex.as_str());
+        details.stratum_stats = Some(stratum_stats);
+        details.seed = Some(self.base_rng.seed());
+
+        let result: Vec<(Option<String>, String)> = selected
+            .into_iter()
+            .map(|(_, line, stratum)| (Some(stratum), line))
+            .collect();
+
+        (result, details)
+    }
+}
+
+struct EveryStrategy {
+    n: usize,
+}
+
+impl StreamingStrategy for EveryStrategy {
+    type State = usize;
+
+    fn init_state(&self, _rng: StdRng) -> usize {
+        0
+    }
+
+    fn should_sample(&self, counter: &mut usize, _line: &str) -> bool {
+        let should_output = (*counter).is_multiple_of(self.n);
+        *counter += 1;
+        should_output
+    }
+
+    fn format_details(&self) -> StrategyDetails {
+        let mut parameters = HashMap::new();
+        parameters.insert("interval".to_string(), self.n.to_string());
+
+        let mut expectations = HashMap::new();
+        expectations.insert(
+            "sampling_rate".to_string(),
+            format!("{:.4}", 1.0 / self.n as f64),
+        );
+
+        StrategyDetails {
+            name: "Every-Nth Sampling".to_string(),
+            parameters,
+            seed: None,
+            expectations,
+            stratum_stats: None,
+        }
+    }
+}
+
+struct RateStrategy {
+    rate: f64,
+}
+
+impl StreamingStrategy for RateStrategy {
+    type State = StdRng;
+
+    fn init_state(&self, rng: StdRng) -> StdRng {
+        rng
+    }
+
+    fn should_sample(&self, rng: &mut StdRng, _line: &str) -> bool {
+        rng.gen::<f64>() < self.rate
+    }
+
+    fn format_details(&self) -> StrategyDetails {
+        let mut parameters = HashMap::new();
+        parameters.insert("rate".to_string(), format!("{:.4}", self.rate));
+
+        let mut expectations = HashMap::new();
+        expectations.insert("sampling_rate".to_string(), format!("{:.4}", self.rate));
+
+        StrategyDetails {
+            name: "Rate Sampling".to_string(),
+            parameters,
+            seed: None,
+            expectations,
+            stratum_stats: None,
+        }
+    }
+}
+
+struct ThrottleStrategy {
+    duration: Duration,
+}
+
+impl StreamingStrategy for ThrottleStrategy {
+    type State = Option<Instant>;
+
+    fn init_state(&self, _rng: StdRng) -> Option<Instant> {
+        None
+    }
+
+    fn should_sample(&self, last_output: &mut Option<Instant>, _line: &str) -> bool {
+        let now = Instant::now();
+        let should_output = match *last_output {
+            None => true,
+            Some(last) => now.duration_since(last) >= self.duration,
+        };
+        if should_output {
+            *last_output = Some(now);
+        }
+        should_output
+    }
+
+    fn format_details(&self) -> StrategyDetails {
+        let mut parameters = HashMap::new();
+        parameters.insert("interval".to_string(), format!("{:?}", self.duration));
+
+        let mut expectations = HashMap::new();
+        expectations.insert(
+            "max_rate".to_string(),
+            format!("{:.2} lines/sec", 1.0 / self.duration.as_secs_f64()),
+        );
+
+        StrategyDetails {
+            name: "Throttle Sampling".to_string(),
+            parameters,
+            seed: None,
+            expectations,
+            stratum_stats: None,
+        }
+    }
+}
+
+struct ReservoirState {
+    reservoir: Vec<(usize, String)>,
+    count: usize,
+    lines_seen: usize,
+    rng: StdRng,
+}
+
+struct ReservoirStrategy {
+    count: usize,
+}
+
+impl BatchStrategy for ReservoirStrategy {
+    type State = ReservoirState;
+
+    fn init_state(&self, rng: StdRng) -> ReservoirState {
+        ReservoirState {
+            reservoir: Vec::with_capacity(self.count),
+            count: self.count,
+            lines_seen: 0,
+            rng,
+        }
+    }
+
+    fn add_line(&self, state: &mut ReservoirState, line: String) {
+        let index = state.lines_seen;
+        state.lines_seen += 1;
+
+        if index < state.count {
+            state.reservoir.push((index, line));
+        } else {
+            let j = state.rng.gen_range(0..=index);
+            if j < state.count {
+                state.reservoir[j] = (index, line);
+            }
+        }
+    }
+
+    fn finalize(&self, mut state: ReservoirState) -> Vec<(usize, String)> {
+        state.reservoir.sort_by_key(|(idx, _)| *idx);
+        state.reservoir
+    }
+
+    fn format_details(&self) -> StrategyDetails {
+        let mut parameters = HashMap::new();
+        parameters.insert("count".to_string(), self.count.to_string());
+
+        let mut expectations = HashMap::new();
+        expectations.insert("maintains_order".to_string(), "yes".to_string());
+
+        StrategyDetails {
+            name: "Reservoir Sampling".to_string(),
+            parameters,
+            seed: None,
+            expectations,
+            stratum_stats: None,
+        }
+    }
+}
+
 enum SamplingMode {
-    Every(usize),
-    Rate { rate: f64, seed: u64 },
-    Reservoir { count: usize, seed: u64 },
-    EveryStratified { n: usize, regex: Regex },
-    RateStratified { rate: f64, seed: u64, regex: Regex },
-    Throttle { duration: Duration },
-    ThrottleStratified { duration: Duration, regex: Regex },
+    Streaming(Box<dyn StreamingSampler>),
+    Batch(Box<dyn BatchSampler>),
 }
 
 impl SamplingMode {
     fn sample(self, reader: BufReader<impl Read>, writer: &mut impl Write) -> Result<Statistics> {
-        // Clone mode before creating stats to avoid borrow checker issues
-        let mode_clone = self.clone();
-        let mut stats = Statistics::new(self);
-
-        match mode_clone {
-            SamplingMode::Every(n) => {
-                for (index, line) in reader.lines().enumerate() {
-                    let line = line?;
-                    stats.lines_read += 1;
-
-                    // Output every Nth line (0-indexed: 0, N, 2N, ...)
-                    if index % n == 0 {
-                        writeln!(writer, "{}", line)?;
-                        stats.lines_output += 1;
-                    }
-                }
-            }
-            SamplingMode::Rate { rate, seed } => {
-                let mut rng = StdRng::seed_from_u64(seed);
+        match self {
+            SamplingMode::Streaming(mut machine) => {
+                let mut lines_read = 0;
+                let mut lines_output = 0;
 
                 for line in reader.lines() {
                     let line = line?;
-                    stats.lines_read += 1;
+                    let result = machine.process_line(&line);
 
-                    // Random sampling with given probability
-                    if rng.gen::<f64>() < rate {
+                    lines_read += 1;
+                    if result.sampled {
                         writeln!(writer, "{}", line)?;
-                        stats.lines_output += 1;
+                        lines_output += 1;
                     }
                 }
+
+                let details = machine.format_details();
+                Ok(Statistics::new(details, lines_read, lines_output))
             }
-            SamplingMode::Reservoir { count, seed } => {
-                let mut rng = StdRng::seed_from_u64(seed);
-                let mut reservoir: Vec<String> = Vec::with_capacity(count);
+            SamplingMode::Batch(mut executor) => {
+                let mut lines_read = 0;
 
-                for (index, line) in reader.lines().enumerate() {
+                for line in reader.lines() {
                     let line = line?;
-                    stats.lines_read += 1;
-
-                    if index < count {
-                        // Fill reservoir with first k lines
-                        reservoir.push(line);
-                    } else {
-                        // Randomly replace elements with decreasing probability
-                        let j = rng.gen_range(0..=index);
-                        if j < count {
-                            reservoir[j] = line;
-                        }
-                    }
+                    executor.collect_line(line);
+                    lines_read += 1;
                 }
 
-                // Write buffered output
-                stats.lines_output = reservoir.len();
-                for line in reservoir {
+                let (selected, details) = executor.finalize();
+                let lines_output = selected.len();
+
+                for (_stratum_key, line) in selected {
                     writeln!(writer, "{}", line)?;
                 }
-            }
-            SamplingMode::EveryStratified { n, regex } => {
-                let mut stratum_counters: HashMap<String, usize> = HashMap::new();
 
-                for line in reader.lines() {
-                    let line = line?;
-                    let key = extract_stratum_key(&line, &regex);
-
-                    let counter = stratum_counters.entry(key.clone()).or_insert(0);
-                    stats.increment_read(&key);
-
-                    if *counter % n == 0 {
-                        writeln!(writer, "{}", line)?;
-                        stats.increment_output(&key);
-                    }
-
-                    *counter += 1;
-                }
-            }
-            SamplingMode::RateStratified { rate, seed, regex } => {
-                let mut stratum_rngs: HashMap<String, StdRng> = HashMap::new();
-
-                for line in reader.lines() {
-                    let line = line?;
-                    let key = extract_stratum_key(&line, &regex);
-
-                    let rng = stratum_rngs
-                        .entry(key.clone())
-                        .or_insert_with(|| StdRng::seed_from_u64(derive_seed(seed, &key)));
-
-                    stats.increment_read(&key);
-
-                    if rng.gen::<f64>() < rate {
-                        writeln!(writer, "{}", line)?;
-                        stats.increment_output(&key);
-                    }
-                }
-            }
-            SamplingMode::Throttle { duration } => {
-                let mut last_output: Option<Instant> = None;
-
-                for line in reader.lines() {
-                    let line = line?;
-                    stats.lines_read += 1;
-
-                    let now = Instant::now();
-                    let should_output = match last_output {
-                        None => true, // First line always outputs
-                        Some(last) => now.duration_since(last) >= duration,
-                    };
-
-                    if should_output {
-                        writeln!(writer, "{}", line)?;
-                        stats.lines_output += 1;
-                        last_output = Some(now);
-                    }
-                }
-            }
-            SamplingMode::ThrottleStratified { duration, regex } => {
-                let mut stratum_last_output: HashMap<String, Instant> = HashMap::new();
-
-                for line in reader.lines() {
-                    let line = line?;
-                    let key = extract_stratum_key(&line, &regex);
-                    stats.increment_read(&key);
-
-                    let now = Instant::now();
-                    let should_output = match stratum_last_output.get(&key) {
-                        None => true, // First line in this stratum always outputs
-                        Some(last) => now.duration_since(*last) >= duration,
-                    };
-
-                    if should_output {
-                        writeln!(writer, "{}", line)?;
-                        stats.increment_output(&key);
-                        stratum_last_output.insert(key, now);
-                    }
-                }
+                Ok(Statistics::new(details, lines_read, lines_output))
             }
         }
-
-        Ok(stats)
     }
+}
+
+#[cfg(test)]
+macro_rules! every {
+    ($n:expr) => {
+        EveryStrategy { n: $n }
+    };
+}
+
+#[cfg(test)]
+macro_rules! rate {
+    ($rate:expr) => {
+        RateStrategy { rate: $rate }
+    };
+}
+
+#[cfg(test)]
+macro_rules! throttle {
+    ($duration:expr) => {
+        ThrottleStrategy {
+            duration: $duration,
+        }
+    };
+}
+
+#[cfg(test)]
+macro_rules! reservoir {
+    ($count:expr) => {
+        ReservoirStrategy { count: $count }
+    };
+}
+
+#[cfg(test)]
+macro_rules! uniform_stream {
+    ($strategy:expr, seed: $seed:expr) => {
+        SamplingMode::Streaming(Box::new(UniformStreamSampler::new(
+            $strategy,
+            SeededRng::new($seed),
+        )))
+    };
+}
+
+#[cfg(test)]
+macro_rules! stratified_stream {
+    ($strategy:expr, pattern: $pattern:expr, seed: $seed:expr) => {
+        SamplingMode::Streaming(Box::new(StratifiedStreamSampler::new(
+            $strategy,
+            Regex::new($pattern).unwrap(),
+            SeededRng::new($seed),
+        )))
+    };
+}
+
+#[cfg(test)]
+macro_rules! uniform_batch {
+    ($strategy:expr, seed: $seed:expr) => {
+        SamplingMode::Batch(Box::new(UniformBatchSampler::new(
+            $strategy,
+            SeededRng::new($seed),
+        )))
+    };
+}
+
+#[cfg(test)]
+macro_rules! stratified_batch {
+    ($strategy:expr, pattern: $pattern:expr, seed: $seed:expr) => {
+        SamplingMode::Batch(Box::new(StratifiedBatchSampler::new(
+            $strategy,
+            Regex::new($pattern).unwrap(),
+            SeededRng::new($seed),
+        )))
+    };
+}
+
+macro_rules! streaming {
+    ($strategy:expr, $regex_opt:expr, $seed:expr) => {
+        match $regex_opt {
+            Some(regex) => SamplingMode::Streaming(Box::new(StratifiedStreamSampler::new(
+                $strategy,
+                regex,
+                SeededRng::new($seed),
+            ))),
+            None => SamplingMode::Streaming(Box::new(UniformStreamSampler::new(
+                $strategy,
+                SeededRng::new($seed),
+            ))),
+        }
+    };
+}
+
+macro_rules! batch {
+    ($strategy:expr, $regex_opt:expr, $seed:expr) => {
+        match $regex_opt {
+            Some(regex) => SamplingMode::Batch(Box::new(StratifiedBatchSampler::new(
+                $strategy,
+                regex,
+                SeededRng::new($seed),
+            ))),
+            None => SamplingMode::Batch(Box::new(UniformBatchSampler::new(
+                $strategy,
+                SeededRng::new($seed),
+            ))),
+        }
+    };
 }
 
 impl From<&Sample> for SamplingMode {
@@ -255,7 +724,6 @@ impl From<&Sample> for SamplingMode {
                 .as_secs()
         });
 
-        // Compile regex if stratify is present
         let regex_opt = sample
             .stratify
             .as_ref()
@@ -266,109 +734,64 @@ impl From<&Sample> for SamplingMode {
             sample.rate,
             sample.count,
             sample.throttle.as_ref(),
-            regex_opt,
         ) {
-            // Stratified throttle modes
-            (None, None, None, Some(duration), Some(regex)) => SamplingMode::ThrottleStratified {
-                duration: *duration,
-                regex,
-            },
-
-            // Non-stratified throttle mode
-            (None, None, None, Some(duration), None) => SamplingMode::Throttle {
-                duration: *duration,
-            },
-
-            // Stratified modes
-            (Some(n), None, None, None, Some(regex)) => SamplingMode::EveryStratified {
-                n: n as usize,
-                regex,
-            },
-            (None, Some(rate), None, None, Some(regex)) => {
-                SamplingMode::RateStratified { rate, seed, regex }
+            (Some(n), None, None, None) => {
+                streaming!(EveryStrategy { n: n as usize }, regex_opt, seed)
             }
 
-            // Non-stratified modes
-            (Some(n), None, None, None, None) => SamplingMode::Every(n as usize),
-            (None, Some(rate), None, None, None) => SamplingMode::Rate { rate, seed },
-            (None, None, Some(count), None, None) => SamplingMode::Reservoir {
-                count: count as usize,
-                seed,
-            },
+            (None, Some(rate), None, None) => {
+                streaming!(RateStrategy { rate }, regex_opt, seed)
+            }
 
-            // Default (no mode specified)
-            (None, None, None, None, regex_opt) => {
+            (None, None, None, Some(duration)) => {
+                streaming!(
+                    ThrottleStrategy {
+                        duration: *duration
+                    },
+                    regex_opt,
+                    seed
+                )
+            }
+
+            (None, None, Some(count), None) => {
+                batch!(
+                    ReservoirStrategy {
+                        count: count as usize,
+                    },
+                    regex_opt,
+                    seed
+                )
+            }
+
+            (None, None, None, None) => {
                 warn!("No sampling mode specified. Defaulting to --count 20");
-                if regex_opt.is_some() {
-                    warn!("--stratify ignored without --every, --rate, or --throttle");
-                }
-                SamplingMode::Reservoir { count: 20, seed }
+                batch!(ReservoirStrategy { count: 20 }, regex_opt, seed)
             }
 
-            // Invalid combinations (should be caught by clap)
             _ => unreachable!("Clap should prevent invalid mode combinations"),
         }
     }
 }
 
 #[derive(Debug, Clone)]
-struct StratumStats {
-    lines_read: usize,
-    lines_output: usize,
+pub struct StratumStats {
+    pub lines_read: usize,
+    pub lines_output: usize,
 }
 
 #[derive(Debug)]
 struct Statistics {
-    mode: SamplingMode,
+    details: StrategyDetails,
     lines_read: usize,
     lines_output: usize,
-    strata_stats: Option<HashMap<String, StratumStats>>,
 }
 
 impl Statistics {
-    fn new(mode: SamplingMode) -> Self {
-        let stratified = matches!(
-            mode,
-            SamplingMode::EveryStratified { .. }
-                | SamplingMode::RateStratified { .. }
-                | SamplingMode::ThrottleStratified { .. }
-        );
-
+    fn new(details: StrategyDetails, lines_read: usize, lines_output: usize) -> Self {
         Statistics {
-            mode,
-            lines_read: 0,
-            lines_output: 0,
-            strata_stats: if stratified {
-                Some(HashMap::new())
-            } else {
-                None
-            },
-        }
-    }
-
-    fn increment_read(&mut self, stratum: &str) {
-        self.lines_read += 1;
-        if let Some(ref mut strata) = self.strata_stats {
-            strata
-                .entry(stratum.to_string())
-                .or_insert(StratumStats {
-                    lines_read: 0,
-                    lines_output: 0,
-                })
-                .lines_read += 1;
-        }
-    }
-
-    fn increment_output(&mut self, stratum: &str) {
-        self.lines_output += 1;
-        if let Some(ref mut strata) = self.strata_stats {
-            strata
-                .entry(stratum.to_string())
-                .or_insert(StratumStats {
-                    lines_read: 0,
-                    lines_output: 0,
-                })
-                .lines_output += 1;
+            details,
+            lines_read,
+            lines_output,
         }
     }
 
@@ -383,70 +806,22 @@ impl Statistics {
     fn print_to_stderr(&self) -> Result<()> {
         let stderr = std::io::stderr();
         let mut stderr = stderr.lock();
+        self.write_stats(&mut stderr)
+    }
 
-        // Mode-specific details
-        match &self.mode {
-            SamplingMode::Every(n) => {
-                writeln!(stderr, "Mode: Deterministic Every-Nth")?;
-                writeln!(stderr, "  N (interval): {}", n)?;
-                writeln!(stderr, "  Expected rate: {:.4}", 1.0 / *n as f64)?;
-            }
-            SamplingMode::Rate { rate, seed } => {
-                writeln!(stderr, "Mode: Random Rate-Based")?;
-                writeln!(stderr, "  Target rate: {:.4}", rate)?;
-                writeln!(stderr, "  Random seed: {}", seed)?;
-                writeln!(
-                    stderr,
-                    "  Expected output: {:.1} lines",
-                    self.lines_read as f64 * rate
-                )?;
-            }
-            SamplingMode::Reservoir { count, seed } => {
-                writeln!(stderr, "Mode: Reservoir Sampling")?;
-                writeln!(stderr, "  Target count: {}", count)?;
-                writeln!(stderr, "  Random seed: {}", seed)?;
-                writeln!(stderr, "  Maintains input order: yes")?;
-            }
-            SamplingMode::EveryStratified { n, regex } => {
-                writeln!(stderr, "Mode: Stratified Every-Nth")?;
-                writeln!(stderr, "  N (interval): {}", n)?;
-                writeln!(stderr, "  Stratification pattern: {}", regex.as_str())?;
-                writeln!(stderr, "  Per-stratum sampling: every {}th line", n)?;
-            }
-            SamplingMode::RateStratified { rate, seed, regex } => {
-                writeln!(stderr, "Mode: Stratified Rate-Based")?;
-                writeln!(stderr, "  Target rate: {:.4}", rate)?;
-                writeln!(stderr, "  Random seed: {}", seed)?;
-                writeln!(stderr, "  Stratification pattern: {}", regex.as_str())?;
-                writeln!(stderr, "  Per-stratum sampling: independent RNGs")?;
-            }
-            SamplingMode::Throttle { duration } => {
-                writeln!(stderr, "Mode: Time-Based Throttling")?;
-                writeln!(stderr, "  Minimum interval: {:?}", duration)?;
-                writeln!(
-                    stderr,
-                    "  Max output rate: {:.2} lines/sec",
-                    1.0 / duration.as_secs_f64()
-                )?;
-            }
-            SamplingMode::ThrottleStratified { duration, regex } => {
-                writeln!(stderr, "Mode: Stratified Time-Based Throttling")?;
-                writeln!(stderr, "  Minimum interval: {:?}", duration)?;
-                writeln!(
-                    stderr,
-                    "  Max output rate: {:.2} lines/sec",
-                    1.0 / duration.as_secs_f64()
-                )?;
-                writeln!(stderr, "  Stratification pattern: {}", regex.as_str())?;
-                writeln!(stderr, "  Per-stratum throttling: independent timers")?;
-            }
-        }
+    fn write_stats(&self, writer: &mut impl std::io::Write) -> Result<()> {
+        let percent = self.effective_rate() * 100.0;
+        writeln!(
+            writer,
+            "{} / {} ({:.2}%)",
+            self.lines_output, self.lines_read, percent
+        )?;
 
-        // Show stratum breakdown if stratified
-        if let Some(ref strata) = self.strata_stats {
-            writeln!(stderr)?;
-            writeln!(stderr, "Stratification:")?;
-            writeln!(stderr, "  Strata found: {}", strata.len())?;
+        write!(writer, "{}", self.details)?;
+
+        if let Some(ref strata) = self.details.stratum_stats {
+            writeln!(writer, "stratification:")?;
+            writeln!(writer, "  strata found: {}", strata.len())?;
 
             let mut sorted_strata: Vec<_> = strata.iter().collect();
             sorted_strata.sort_by_key(|(k, _)| k.as_str());
@@ -459,7 +834,7 @@ impl Statistics {
                     0.0
                 };
                 writeln!(
-                    stderr,
+                    writer,
                     "    {}: {} lines ({:.1}%) -> sampled {} ({:.1}%)",
                     key,
                     stats.lines_read,
@@ -469,17 +844,6 @@ impl Statistics {
                 )?;
             }
         }
-
-        writeln!(stderr)?;
-        writeln!(stderr, "Results:")?;
-        writeln!(stderr, "  Lines read: {}", self.lines_read)?;
-        writeln!(stderr, "  Lines output: {}", self.lines_output)?;
-        writeln!(
-            stderr,
-            "  Effective sampling rate: {:.4} ({:.2}%)",
-            self.effective_rate(),
-            self.effective_rate() * 100.0
-        )?;
 
         Ok(())
     }
@@ -523,7 +887,7 @@ mod tests {
             line5
         "};
         let reader = BufReader::new(Cursor::new(input));
-        let mode = SamplingMode::Every(2);
+        let mode = uniform_stream!(every!(2), seed: 0);
         let mut output = Vec::new();
 
         let stats = mode.sample(reader, &mut output).unwrap();
@@ -545,7 +909,7 @@ mod tests {
             line5
         "};
         let reader = BufReader::new(Cursor::new(input));
-        let mode = SamplingMode::Every(5);
+        let mode = uniform_stream!(every!(5), seed: 0);
         let mut output = Vec::new();
 
         let stats = mode.sample(reader, &mut output).unwrap();
@@ -561,7 +925,10 @@ mod tests {
     fn test_sample_every_single_line() {
         let input = "line1\n";
         let reader = BufReader::new(Cursor::new(input));
-        let mode = SamplingMode::Every(10);
+        let mode = SamplingMode::Streaming(Box::new(UniformStreamSampler::new(
+            EveryStrategy { n: 10 },
+            SeededRng::new(0),
+        )));
         let mut output = Vec::new();
 
         let stats = mode.sample(reader, &mut output).unwrap();
@@ -589,14 +956,8 @@ mod tests {
         "};
         let reader1 = BufReader::new(Cursor::new(input));
         let reader2 = BufReader::new(Cursor::new(input));
-        let mode1 = SamplingMode::Rate {
-            rate: 0.5,
-            seed: 42,
-        };
-        let mode2 = SamplingMode::Rate {
-            rate: 0.5,
-            seed: 42,
-        };
+        let mode1 = uniform_stream!(rate!(0.5), seed: 42);
+        let mode2 = uniform_stream!(rate!(0.5), seed: 42);
         let mut output1 = Vec::new();
         let mut output2 = Vec::new();
 
@@ -616,10 +977,10 @@ mod tests {
             line3
         "};
         let reader = BufReader::new(Cursor::new(input));
-        let mode = SamplingMode::Rate {
-            rate: 0.0,
-            seed: 42,
-        };
+        let mode = SamplingMode::Streaming(Box::new(UniformStreamSampler::new(
+            RateStrategy { rate: 0.0 },
+            SeededRng::new(42),
+        )));
         let mut output = Vec::new();
 
         let stats = mode.sample(reader, &mut output).unwrap();
@@ -637,10 +998,10 @@ mod tests {
             line3
         "};
         let reader = BufReader::new(Cursor::new(input));
-        let mode = SamplingMode::Rate {
-            rate: 1.0,
-            seed: 42,
-        };
+        let mode = SamplingMode::Streaming(Box::new(UniformStreamSampler::new(
+            RateStrategy { rate: 1.0 },
+            SeededRng::new(42),
+        )));
         let mut output = Vec::new();
 
         let stats = mode.sample(reader, &mut output).unwrap();
@@ -659,10 +1020,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let reader = BufReader::new(Cursor::new(input));
-        let mode = SamplingMode::Reservoir {
-            count: 10,
-            seed: 42,
-        };
+        let mode = uniform_batch!(reservoir!(10), seed: 42);
         let mut output = Vec::new();
 
         let stats = mode.sample(reader, &mut output).unwrap();
@@ -682,10 +1040,10 @@ mod tests {
             line3
         "};
         let reader = BufReader::new(Cursor::new(input));
-        let mode = SamplingMode::Reservoir {
-            count: 10,
-            seed: 42,
-        };
+        let mode = SamplingMode::Batch(Box::new(UniformBatchSampler::new(
+            ReservoirStrategy { count: 10 },
+            SeededRng::new(42),
+        )));
         let mut output = Vec::new();
 
         let stats = mode.sample(reader, &mut output).unwrap();
@@ -706,14 +1064,8 @@ mod tests {
             .join("\n");
         let reader1 = BufReader::new(Cursor::new(&input));
         let reader2 = BufReader::new(Cursor::new(&input));
-        let mode1 = SamplingMode::Reservoir {
-            count: 10,
-            seed: 42,
-        };
-        let mode2 = SamplingMode::Reservoir {
-            count: 10,
-            seed: 42,
-        };
+        let mode1 = uniform_batch!(reservoir!(10), seed: 42);
+        let mode2 = uniform_batch!(reservoir!(10), seed: 42);
         let mut output1 = Vec::new();
         let mut output2 = Vec::new();
 
@@ -734,7 +1086,10 @@ mod tests {
             line5
         "};
         let reader = BufReader::new(Cursor::new(input));
-        let mode = SamplingMode::Reservoir { count: 3, seed: 42 };
+        let mode = SamplingMode::Batch(Box::new(UniformBatchSampler::new(
+            ReservoirStrategy { count: 3 },
+            SeededRng::new(42),
+        )));
         let mut output = Vec::new();
 
         mode.sample(reader, &mut output).unwrap();
@@ -754,7 +1109,10 @@ mod tests {
     fn test_empty_input() {
         let input = "";
         let reader = BufReader::new(Cursor::new(input));
-        let mode = SamplingMode::Every(5);
+        let mode = SamplingMode::Streaming(Box::new(UniformStreamSampler::new(
+            EveryStrategy { n: 5 },
+            SeededRng::new(0),
+        )));
         let mut output = Vec::new();
 
         let stats = mode.sample(reader, &mut output).unwrap();
@@ -766,24 +1124,28 @@ mod tests {
 
     #[test]
     fn test_statistics_effective_rate() {
-        let stats = Statistics {
-            mode: SamplingMode::Every(1),
-            lines_read: 100,
-            lines_output: 25,
-            strata_stats: None,
+        let details = StrategyDetails {
+            name: "Test mode".to_string(),
+            parameters: HashMap::new(),
+            seed: None,
+            expectations: HashMap::new(),
+            stratum_stats: None,
         };
+        let stats = Statistics::new(details, 100, 25);
 
         assert_eq!(stats.effective_rate(), 0.25);
     }
 
     #[test]
     fn test_statistics_effective_rate_zero_input() {
-        let stats = Statistics {
-            mode: SamplingMode::Every(1),
-            lines_read: 0,
-            lines_output: 0,
-            strata_stats: None,
+        let details = StrategyDetails {
+            name: "Test mode".to_string(),
+            parameters: HashMap::new(),
+            seed: None,
+            expectations: HashMap::new(),
+            stratum_stats: None,
         };
+        let stats = Statistics::new(details, 0, 0);
         assert_eq!(stats.effective_rate(), 0.0);
     }
 
@@ -801,20 +1163,6 @@ mod tests {
     }
 
     #[test]
-    fn test_derive_seed_deterministic() {
-        let seed1 = derive_seed(42, "INFO");
-        let seed2 = derive_seed(42, "INFO");
-        assert_eq!(seed1, seed2);
-    }
-
-    #[test]
-    fn test_derive_seed_different_strata() {
-        let seed1 = derive_seed(42, "INFO");
-        let seed2 = derive_seed(42, "ERROR");
-        assert_ne!(seed1, seed2);
-    }
-
-    #[test]
     fn test_every_stratified_basic() {
         let input = indoc! {"
             [INFO] 1
@@ -824,8 +1172,7 @@ mod tests {
             [INFO] 5
         "};
         let reader = BufReader::new(Cursor::new(input));
-        let regex = Regex::new(r"\[(INFO|ERROR)\]").unwrap();
-        let mode = SamplingMode::EveryStratified { n: 2, regex };
+        let mode = stratified_stream!(every!(2), pattern: r"\[(INFO|ERROR)\]", seed: 0);
         let mut output = Vec::new();
 
         let stats = mode.sample(reader, &mut output).unwrap();
@@ -853,7 +1200,11 @@ mod tests {
         "};
         let reader = BufReader::new(Cursor::new(input));
         let regex = Regex::new(r"[AB]").unwrap();
-        let mode = SamplingMode::EveryStratified { n: 2, regex };
+        let mode = SamplingMode::Streaming(Box::new(StratifiedStreamSampler::new(
+            EveryStrategy { n: 2 },
+            regex,
+            SeededRng::new(0),
+        )));
         let mut output = Vec::new();
 
         let stats = mode.sample(reader, &mut output).unwrap();
@@ -877,18 +1228,8 @@ mod tests {
 
         let reader1 = BufReader::new(Cursor::new(&input));
         let reader2 = BufReader::new(Cursor::new(&input));
-        let regex1 = Regex::new(r"\[INFO\]").unwrap();
-        let regex2 = Regex::new(r"\[INFO\]").unwrap();
-        let mode1 = SamplingMode::RateStratified {
-            rate: 0.5,
-            seed: 42,
-            regex: regex1,
-        };
-        let mode2 = SamplingMode::RateStratified {
-            rate: 0.5,
-            seed: 42,
-            regex: regex2,
-        };
+        let mode1 = stratified_stream!(rate!(0.5), pattern: r"\[INFO\]", seed: 42);
+        let mode2 = stratified_stream!(rate!(0.5), pattern: r"\[INFO\]", seed: 42);
         let mut output1 = Vec::new();
         let mut output2 = Vec::new();
 
@@ -911,11 +1252,11 @@ mod tests {
         "};
         let reader = BufReader::new(Cursor::new(input));
         let regex = Regex::new(r"\[(INFO|ERROR)\]").unwrap();
-        let mode = SamplingMode::RateStratified {
-            rate: 0.5,
-            seed: 42,
+        let mode = SamplingMode::Streaming(Box::new(StratifiedStreamSampler::new(
+            RateStrategy { rate: 0.5 },
             regex,
-        };
+            SeededRng::new(42),
+        )));
         let mut output = Vec::new();
 
         let stats = mode.sample(reader, &mut output).unwrap();
@@ -926,8 +1267,8 @@ mod tests {
         assert!(stats.lines_output >= 1 && stats.lines_output <= 3);
 
         // Verify strata stats exist
-        assert!(stats.strata_stats.is_some());
-        let strata = stats.strata_stats.as_ref().unwrap();
+        assert!(stats.details.stratum_stats.is_some());
+        let strata = stats.details.stratum_stats.as_ref().unwrap();
         assert!(strata.contains_key("[INFO]"));
         assert!(strata.contains_key("[ERROR]"));
     }
@@ -942,7 +1283,11 @@ mod tests {
         "};
         let reader = BufReader::new(Cursor::new(input));
         let regex = Regex::new(r"\[(INFO|ERROR)\]").unwrap();
-        let mode = SamplingMode::EveryStratified { n: 1, regex }; // Sample every line
+        let mode = SamplingMode::Streaming(Box::new(StratifiedStreamSampler::new(
+            EveryStrategy { n: 1 },
+            regex,
+            SeededRng::new(0),
+        ))); // Sample every line
         let mut output = Vec::new();
 
         let stats = mode.sample(reader, &mut output).unwrap();
@@ -951,7 +1296,7 @@ mod tests {
         assert_eq!(stats.lines_output, 4); // All lines should be sampled
 
         // Check strata breakdown
-        let strata = stats.strata_stats.as_ref().unwrap();
+        let strata = stats.details.stratum_stats.as_ref().unwrap();
         assert!(strata.contains_key("[INFO]"));
         assert!(strata.contains_key("[ERROR]"));
         assert!(strata.contains_key("unmatched"));
@@ -995,9 +1340,7 @@ mod tests {
             line4
         "};
         let reader = BufReader::new(Cursor::new(input));
-        let mode = SamplingMode::Throttle {
-            duration: Duration::from_millis(10),
-        };
+        let mode = uniform_stream!(throttle!(Duration::from_millis(10)), seed: 0);
         let mut output = Vec::new();
 
         let stats = mode.sample(reader, &mut output).unwrap();
@@ -1022,11 +1365,7 @@ mod tests {
             [INFO] 5
         "};
         let reader = BufReader::new(Cursor::new(input));
-        let regex = Regex::new(r"\[(INFO|ERROR)\]").unwrap();
-        let mode = SamplingMode::ThrottleStratified {
-            duration: Duration::from_millis(10),
-            regex,
-        };
+        let mode = stratified_stream!(throttle!(Duration::from_millis(10)), pattern: r"\[(INFO|ERROR)\]", seed: 0);
         let mut output = Vec::new();
 
         let stats = mode.sample(reader, &mut output).unwrap();
@@ -1042,7 +1381,7 @@ mod tests {
         assert_eq!(stats.lines_output, 2);
 
         // Check strata breakdown
-        let strata = stats.strata_stats.as_ref().unwrap();
+        let strata = stats.details.stratum_stats.as_ref().unwrap();
         assert_eq!(strata["[INFO]"].lines_read, 3);
         assert_eq!(strata["[INFO]"].lines_output, 1);
         assert_eq!(strata["[ERROR]"].lines_read, 2);
@@ -1053,9 +1392,12 @@ mod tests {
     fn test_throttle_single_line() {
         let input = "single line\n";
         let reader = BufReader::new(Cursor::new(input));
-        let mode = SamplingMode::Throttle {
-            duration: Duration::from_secs(1),
-        };
+        let mode = SamplingMode::Streaming(Box::new(UniformStreamSampler::new(
+            ThrottleStrategy {
+                duration: Duration::from_secs(1),
+            },
+            SeededRng::new(0),
+        )));
         let mut output = Vec::new();
 
         let stats = mode.sample(reader, &mut output).unwrap();
@@ -1066,5 +1408,230 @@ mod tests {
         assert_eq!(lines, vec!["single line"]);
         assert_eq!(stats.lines_read, 1);
         assert_eq!(stats.lines_output, 1);
+    }
+
+    #[test]
+    fn test_stratified_reservoir_sampling() {
+        let input = indoc! {"
+            [INFO] 1
+            [INFO] 2
+            [ERROR] 3
+            [INFO] 4
+            [ERROR] 5
+            [INFO] 6
+            [ERROR] 7
+            [INFO] 8
+        "};
+        let reader = BufReader::new(Cursor::new(input));
+        let mode = stratified_batch!(reservoir!(2), pattern: r"\[(INFO|ERROR)\]", seed: 42);
+        let mut output = Vec::new();
+
+        let stats = mode.sample(reader, &mut output).unwrap();
+
+        // Should have selected 2 from each stratum = 4 total
+        assert_eq!(stats.lines_output, 4);
+        assert_eq!(stats.lines_read, 8);
+
+        // Check strata breakdown
+        let strata = stats.details.stratum_stats.as_ref().unwrap();
+        assert_eq!(strata["[INFO]"].lines_read, 5);
+        assert_eq!(strata["[INFO]"].lines_output, 2);
+        assert_eq!(strata["[ERROR]"].lines_read, 3);
+        assert_eq!(strata["[ERROR]"].lines_output, 2);
+
+        // Verify output maintains input order
+        let result = String::from_utf8(output).unwrap();
+        let lines: Vec<&str> = result.lines().collect();
+
+        // Lines should be interleaved (INFO and ERROR mixed in input order)
+        // Extract line numbers and verify they're ascending
+        let line_numbers: Vec<i32> = lines
+            .iter()
+            .map(|l| l.split_whitespace().last().unwrap().parse().unwrap())
+            .collect();
+
+        for i in 0..line_numbers.len() - 1 {
+            assert!(
+                line_numbers[i] < line_numbers[i + 1],
+                "Lines should maintain input order across strata"
+            );
+        }
+    }
+
+    #[test]
+    fn test_stratified_reservoir_deterministic() {
+        let input = (0..100)
+            .map(|i| {
+                let tag = if i % 2 == 0 { "EVEN" } else { "ODD" };
+                format!("[{}] line{}", tag, i)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let reader1 = BufReader::new(Cursor::new(&input));
+        let reader2 = BufReader::new(Cursor::new(&input));
+        let regex1 = Regex::new(r"\[(EVEN|ODD)\]").unwrap();
+        let regex2 = Regex::new(r"\[(EVEN|ODD)\]").unwrap();
+        let strategy1 = ReservoirStrategy { count: 5 };
+        let strategy2 = ReservoirStrategy { count: 5 };
+        let mode1 = SamplingMode::Batch(Box::new(StratifiedBatchSampler::new(
+            strategy1,
+            regex1,
+            SeededRng::new(42),
+        )));
+        let mode2 = SamplingMode::Batch(Box::new(StratifiedBatchSampler::new(
+            strategy2,
+            regex2,
+            SeededRng::new(42),
+        )));
+        let mut output1 = Vec::new();
+        let mut output2 = Vec::new();
+
+        mode1.sample(reader1, &mut output1).unwrap();
+        mode2.sample(reader2, &mut output2).unwrap();
+
+        // Same seed should produce identical output
+        assert_eq!(output1, output2);
+    }
+
+    #[test]
+    fn test_stratified_reservoir_insufficient_lines() {
+        // When reservoir count > stratum size, should return all lines from that stratum
+        let input = indoc! {"
+            [INFO] 1
+            [INFO] 2
+            [ERROR] 3
+        "};
+        let reader = BufReader::new(Cursor::new(input));
+        let regex = Regex::new(r"\[(INFO|ERROR)\]").unwrap();
+        let strategy = ReservoirStrategy { count: 10 };
+        let mode = SamplingMode::Batch(Box::new(StratifiedBatchSampler::new(
+            strategy,
+            regex,
+            SeededRng::new(42),
+        )));
+        let mut output = Vec::new();
+
+        let stats = mode.sample(reader, &mut output).unwrap();
+
+        // Should output all lines (count > available in each stratum)
+        assert_eq!(stats.lines_output, 3);
+        let strata = stats.details.stratum_stats.as_ref().unwrap();
+        assert_eq!(strata["[INFO]"].lines_output, 2);
+        assert_eq!(strata["[ERROR]"].lines_output, 1);
+    }
+
+    #[test]
+    fn test_reservoir_state_index_tracking() {
+        // Unit test to verify ReservoirState maintains indices correctly
+        let strategy = ReservoirStrategy { count: 3 };
+        let rng = StdRng::seed_from_u64(42);
+        let mut state = strategy.init_state(rng);
+
+        // Add 10 lines
+        for i in 0..10 {
+            strategy.add_line(&mut state, format!("line{}", i));
+        }
+
+        let selected = strategy.finalize(state);
+
+        // Should have 3 lines
+        assert_eq!(selected.len(), 3);
+
+        // Indices should be in ascending order (input order preserved)
+        for i in 0..selected.len() - 1 {
+            assert!(
+                selected[i].0 < selected[i + 1].0,
+                "Indices should be in ascending order"
+            );
+        }
+
+        // All indices should be < 10
+        for (idx, _) in &selected {
+            assert!(*idx < 10);
+        }
+    }
+
+    #[test]
+    fn test_stratified_reservoir_single_stratum() {
+        // Edge case: stratified sampling with only one stratum should work like non-stratified
+        let input = indoc! {"
+            [INFO] 1
+            [INFO] 2
+            [INFO] 3
+            [INFO] 4
+            [INFO] 5
+        "};
+        let reader = BufReader::new(Cursor::new(input));
+        let regex = Regex::new(r"\[INFO\]").unwrap();
+        let strategy = ReservoirStrategy { count: 2 };
+        let mode = SamplingMode::Batch(Box::new(StratifiedBatchSampler::new(
+            strategy,
+            regex,
+            SeededRng::new(42),
+        )));
+        let mut output = Vec::new();
+
+        let stats = mode.sample(reader, &mut output).unwrap();
+
+        assert_eq!(stats.lines_output, 2);
+        let strata = stats.details.stratum_stats.as_ref().unwrap();
+        assert_eq!(strata.len(), 1);
+        assert_eq!(strata["[INFO]"].lines_output, 2);
+    }
+
+    #[test]
+    fn test_statistics_output_format_stratified_rate() {
+        // Test the formatted statistics output for stratified rate sampling
+        let input = indoc! {"
+            [ERROR] critical failure
+            [INFO] starting process
+            [INFO] processing item 1
+            [ERROR] connection timeout
+            [INFO] processing item 2
+            [INFO] processing item 3
+            [ERROR] validation failed
+            [INFO] processing item 4
+            [INFO] processing item 5
+            [INFO] processing item 6
+        "};
+        let reader = BufReader::new(Cursor::new(input));
+        let regex = Regex::new(r"\[(INFO|ERROR)\]").unwrap();
+        let strategy = RateStrategy { rate: 0.5 };
+        let mode = SamplingMode::Streaming(Box::new(StratifiedStreamSampler::new(
+            strategy,
+            regex,
+            SeededRng::new(42),
+        )));
+        let mut output = Vec::new();
+
+        let stats = mode.sample(reader, &mut output).unwrap();
+
+        // Capture the formatted output
+        let mut stats_output = Vec::new();
+        stats.write_stats(&mut stats_output).unwrap();
+        let stats_string = String::from_utf8(stats_output).unwrap();
+
+        // Verify basic structure
+        assert_eq!(stats.lines_read, 10);
+        let strata = stats.details.stratum_stats.as_ref().unwrap();
+        assert_eq!(strata["[ERROR]"].lines_read, 3);
+        assert_eq!(strata["[INFO]"].lines_read, 7);
+
+        // Expected output format (exact counts depend on seed=42 RNG)
+        let expected = indoc! {"
+            5 / 10 (50.00%)
+            Rate Sampling (stratified by \\[(INFO|ERROR)\\])
+              parameters: rate=0.5000
+              seed: 42
+            expectations:
+              sampling_rate: 0.5000
+            stratification:
+              strata found: 2
+                [ERROR]: 3 lines (30.0%) -> sampled 1 (33.3%)
+                [INFO]: 7 lines (70.0%) -> sampled 4 (57.1%)
+        "};
+
+        assert_eq!(stats_string, expected);
     }
 }
