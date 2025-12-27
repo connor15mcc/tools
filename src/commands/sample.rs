@@ -1,27 +1,44 @@
-use crate::command::CommandRunner;
+use std::{
+    collections::{hash_map::DefaultHasher, HashMap},
+    hash::{Hash, Hasher},
+    io::{BufRead, BufReader, Read, Write},
+    time::{Duration, Instant},
+};
+
 use anyhow::Result;
 use clap::Parser;
 use clap_stdin::FileOrStdin;
+use humantime::parse_duration as humantime_parse;
 use log::warn;
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use regex::Regex;
-use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader, Read, Write};
+
+use crate::command::CommandRunner;
 
 fn validate_rate(s: &str) -> Result<f64, String> {
-    let val: f64 = s.parse().map_err(|_| format!("'{}' is not a valid number", s))?;
+    let val: f64 = s
+        .parse()
+        .map_err(|_| format!("'{}' is not a valid number", s))?;
     if !(0.0..=1.0).contains(&val) {
         return Err(format!("rate must be between 0.0 and 1.0, got {}", val));
     }
     Ok(val)
 }
 
+fn parse_duration(s: &str) -> Result<Duration, String> {
+    let duration = humantime_parse(s).map_err(|e| format!("Invalid duration '{}': {}", s, e))?;
+
+    if duration.is_zero() {
+        return Err("Duration must be > 0".to_string());
+    }
+
+    Ok(duration)
+}
+
 /// Extract stratum key from line using regex. Returns "unmatched" if no match.
 fn extract_stratum_key(line: &str, regex: &Regex) -> String {
-    regex.find(line)
+    regex
+        .find(line)
         .map(|m| m.as_str().to_string())
         .unwrap_or_else(|| "unmatched".to_string())
 }
@@ -41,19 +58,23 @@ fn derive_seed(base_seed: u64, stratum_key: &str) -> u64 {
 )]
 pub struct Sample {
     /// Output every Nth line (deterministic sampling)
-    #[arg(long, conflicts_with_all = ["rate", "count"], value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(long, conflicts_with_all = ["rate", "count", "throttle"], value_parser = clap::value_parser!(u64).range(1..))]
     every: Option<u64>,
 
     /// Random sampling probability (0.0-1.0)
-    #[arg(long, conflicts_with_all = ["every", "count"], value_parser = validate_rate)]
+    #[arg(long, conflicts_with_all = ["every", "count", "throttle"], value_parser = validate_rate)]
     rate: Option<f64>,
 
     /// Reservoir sampling - select exactly N lines uniformly
-    #[arg(long, conflicts_with_all = ["every", "rate"], value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(long, conflicts_with_all = ["every", "rate", "throttle"], value_parser = clap::value_parser!(u64).range(1..))]
     count: Option<u64>,
 
+    /// Time-based throttling - minimum time between outputs (e.g., "1s", "500ms")
+    #[arg(long, conflicts_with_all = ["every", "rate", "count"], value_parser = parse_duration)]
+    throttle: Option<Duration>,
+
     /// Random seed for deterministic random sampling (works with --rate and --count)
-    #[arg(long, conflicts_with = "every")]
+    #[arg(long, conflicts_with_all = ["every", "throttle"])]
     seed: Option<u64>,
 
     /// Print verbose statistics to stderr
@@ -61,7 +82,7 @@ pub struct Sample {
     stats: bool,
 
     /// Stratify sampling by regex pattern (entire match becomes stratum key)
-    /// Only works with --every and --rate modes (not --count)
+    /// Works with --every, --rate, and --throttle modes (not --count)
     #[arg(long, value_name = "REGEX", conflicts_with = "count")]
     stratify: Option<String>,
 
@@ -77,6 +98,8 @@ enum SamplingMode {
     Reservoir { count: usize, seed: u64 },
     EveryStratified { n: usize, regex: Regex },
     RateStratified { rate: f64, seed: u64, regex: Regex },
+    Throttle { duration: Duration },
+    ThrottleStratified { duration: Duration, regex: Regex },
 }
 
 impl SamplingMode {
@@ -163,15 +186,56 @@ impl SamplingMode {
                     let line = line?;
                     let key = extract_stratum_key(&line, &regex);
 
-                    let rng = stratum_rngs.entry(key.clone()).or_insert_with(|| {
-                        StdRng::seed_from_u64(derive_seed(seed, &key))
-                    });
+                    let rng = stratum_rngs
+                        .entry(key.clone())
+                        .or_insert_with(|| StdRng::seed_from_u64(derive_seed(seed, &key)));
 
                     stats.increment_read(&key);
 
                     if rng.gen::<f64>() < rate {
                         writeln!(writer, "{}", line)?;
                         stats.increment_output(&key);
+                    }
+                }
+            }
+            SamplingMode::Throttle { duration } => {
+                let mut last_output: Option<Instant> = None;
+
+                for line in reader.lines() {
+                    let line = line?;
+                    stats.lines_read += 1;
+
+                    let now = Instant::now();
+                    let should_output = match last_output {
+                        None => true, // First line always outputs
+                        Some(last) => now.duration_since(last) >= duration,
+                    };
+
+                    if should_output {
+                        writeln!(writer, "{}", line)?;
+                        stats.lines_output += 1;
+                        last_output = Some(now);
+                    }
+                }
+            }
+            SamplingMode::ThrottleStratified { duration, regex } => {
+                let mut stratum_last_output: HashMap<String, Instant> = HashMap::new();
+
+                for line in reader.lines() {
+                    let line = line?;
+                    let key = extract_stratum_key(&line, &regex);
+                    stats.increment_read(&key);
+
+                    let now = Instant::now();
+                    let should_output = match stratum_last_output.get(&key) {
+                        None => true, // First line in this stratum always outputs
+                        Some(last) => now.duration_since(*last) >= duration,
+                    };
+
+                    if should_output {
+                        writeln!(writer, "{}", line)?;
+                        stats.increment_output(&key);
+                        stratum_last_output.insert(key, now);
                     }
                 }
             }
@@ -192,33 +256,51 @@ impl From<&Sample> for SamplingMode {
         });
 
         // Compile regex if stratify is present
-        let regex_opt = sample.stratify.as_ref().map(|pattern| {
-            Regex::new(pattern).expect("Invalid regex pattern")
-        });
+        let regex_opt = sample
+            .stratify
+            .as_ref()
+            .map(|pattern| Regex::new(pattern).expect("Invalid regex pattern"));
 
-        match (sample.every, sample.rate, sample.count, regex_opt) {
+        match (
+            sample.every,
+            sample.rate,
+            sample.count,
+            sample.throttle.as_ref(),
+            regex_opt,
+        ) {
+            // Stratified throttle modes
+            (None, None, None, Some(duration), Some(regex)) => SamplingMode::ThrottleStratified {
+                duration: *duration,
+                regex,
+            },
+
+            // Non-stratified throttle mode
+            (None, None, None, Some(duration), None) => SamplingMode::Throttle {
+                duration: *duration,
+            },
+
             // Stratified modes
-            (Some(n), None, None, Some(regex)) => {
-                SamplingMode::EveryStratified { n: n as usize, regex }
-            }
-            (None, Some(rate), None, Some(regex)) => {
+            (Some(n), None, None, None, Some(regex)) => SamplingMode::EveryStratified {
+                n: n as usize,
+                regex,
+            },
+            (None, Some(rate), None, None, Some(regex)) => {
                 SamplingMode::RateStratified { rate, seed, regex }
             }
 
             // Non-stratified modes
-            (Some(n), None, None, None) => SamplingMode::Every(n as usize),
-            (None, Some(rate), None, None) => {
-                SamplingMode::Rate { rate, seed }
-            }
-            (None, None, Some(count), None) => {
-                SamplingMode::Reservoir { count: count as usize, seed }
-            }
+            (Some(n), None, None, None, None) => SamplingMode::Every(n as usize),
+            (None, Some(rate), None, None, None) => SamplingMode::Rate { rate, seed },
+            (None, None, Some(count), None, None) => SamplingMode::Reservoir {
+                count: count as usize,
+                seed,
+            },
 
             // Default (no mode specified)
-            (None, None, None, regex_opt) => {
+            (None, None, None, None, regex_opt) => {
                 warn!("No sampling mode specified. Defaulting to --count 20");
                 if regex_opt.is_some() {
-                    warn!("--stratify ignored without --every or --rate");
+                    warn!("--stratify ignored without --every, --rate, or --throttle");
                 }
                 SamplingMode::Reservoir { count: 20, seed }
             }
@@ -245,24 +327,34 @@ struct Statistics {
 
 impl Statistics {
     fn new(mode: SamplingMode) -> Self {
-        let stratified = matches!(mode,
-            SamplingMode::EveryStratified { .. } |
-            SamplingMode::RateStratified { .. }
+        let stratified = matches!(
+            mode,
+            SamplingMode::EveryStratified { .. }
+                | SamplingMode::RateStratified { .. }
+                | SamplingMode::ThrottleStratified { .. }
         );
 
         Statistics {
             mode,
             lines_read: 0,
             lines_output: 0,
-            strata_stats: if stratified { Some(HashMap::new()) } else { None },
+            strata_stats: if stratified {
+                Some(HashMap::new())
+            } else {
+                None
+            },
         }
     }
 
     fn increment_read(&mut self, stratum: &str) {
         self.lines_read += 1;
         if let Some(ref mut strata) = self.strata_stats {
-            strata.entry(stratum.to_string())
-                .or_insert(StratumStats { lines_read: 0, lines_output: 0 })
+            strata
+                .entry(stratum.to_string())
+                .or_insert(StratumStats {
+                    lines_read: 0,
+                    lines_output: 0,
+                })
                 .lines_read += 1;
         }
     }
@@ -270,8 +362,12 @@ impl Statistics {
     fn increment_output(&mut self, stratum: &str) {
         self.lines_output += 1;
         if let Some(ref mut strata) = self.strata_stats {
-            strata.entry(stratum.to_string())
-                .or_insert(StratumStats { lines_read: 0, lines_output: 0 })
+            strata
+                .entry(stratum.to_string())
+                .or_insert(StratumStats {
+                    lines_read: 0,
+                    lines_output: 0,
+                })
                 .lines_output += 1;
         }
     }
@@ -323,6 +419,26 @@ impl Statistics {
                 writeln!(stderr, "  Random seed: {}", seed)?;
                 writeln!(stderr, "  Stratification pattern: {}", regex.as_str())?;
                 writeln!(stderr, "  Per-stratum sampling: independent RNGs")?;
+            }
+            SamplingMode::Throttle { duration } => {
+                writeln!(stderr, "Mode: Time-Based Throttling")?;
+                writeln!(stderr, "  Minimum interval: {:?}", duration)?;
+                writeln!(
+                    stderr,
+                    "  Max output rate: {:.2} lines/sec",
+                    1.0 / duration.as_secs_f64()
+                )?;
+            }
+            SamplingMode::ThrottleStratified { duration, regex } => {
+                writeln!(stderr, "Mode: Stratified Time-Based Throttling")?;
+                writeln!(stderr, "  Minimum interval: {:?}", duration)?;
+                writeln!(
+                    stderr,
+                    "  Max output rate: {:.2} lines/sec",
+                    1.0 / duration.as_secs_f64()
+                )?;
+                writeln!(stderr, "  Stratification pattern: {}", regex.as_str())?;
+                writeln!(stderr, "  Per-stratum throttling: independent timers")?;
             }
         }
 
@@ -391,9 +507,11 @@ impl CommandRunner for Sample {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use indoc::indoc;
     use std::io::Cursor;
+
+    use indoc::indoc;
+
+    use super::*;
 
     #[test]
     fn test_sample_every_basic() {
@@ -471,8 +589,14 @@ mod tests {
         "};
         let reader1 = BufReader::new(Cursor::new(input));
         let reader2 = BufReader::new(Cursor::new(input));
-        let mode1 = SamplingMode::Rate { rate: 0.5, seed: 42 };
-        let mode2 = SamplingMode::Rate { rate: 0.5, seed: 42 };
+        let mode1 = SamplingMode::Rate {
+            rate: 0.5,
+            seed: 42,
+        };
+        let mode2 = SamplingMode::Rate {
+            rate: 0.5,
+            seed: 42,
+        };
         let mut output1 = Vec::new();
         let mut output2 = Vec::new();
 
@@ -492,7 +616,10 @@ mod tests {
             line3
         "};
         let reader = BufReader::new(Cursor::new(input));
-        let mode = SamplingMode::Rate { rate: 0.0, seed: 42 };
+        let mode = SamplingMode::Rate {
+            rate: 0.0,
+            seed: 42,
+        };
         let mut output = Vec::new();
 
         let stats = mode.sample(reader, &mut output).unwrap();
@@ -510,7 +637,10 @@ mod tests {
             line3
         "};
         let reader = BufReader::new(Cursor::new(input));
-        let mode = SamplingMode::Rate { rate: 1.0, seed: 42 };
+        let mode = SamplingMode::Rate {
+            rate: 1.0,
+            seed: 42,
+        };
         let mut output = Vec::new();
 
         let stats = mode.sample(reader, &mut output).unwrap();
@@ -529,7 +659,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let reader = BufReader::new(Cursor::new(input));
-        let mode = SamplingMode::Reservoir { count: 10, seed: 42 };
+        let mode = SamplingMode::Reservoir {
+            count: 10,
+            seed: 42,
+        };
         let mut output = Vec::new();
 
         let stats = mode.sample(reader, &mut output).unwrap();
@@ -549,7 +682,10 @@ mod tests {
             line3
         "};
         let reader = BufReader::new(Cursor::new(input));
-        let mode = SamplingMode::Reservoir { count: 10, seed: 42 };
+        let mode = SamplingMode::Reservoir {
+            count: 10,
+            seed: 42,
+        };
         let mut output = Vec::new();
 
         let stats = mode.sample(reader, &mut output).unwrap();
@@ -570,8 +706,14 @@ mod tests {
             .join("\n");
         let reader1 = BufReader::new(Cursor::new(&input));
         let reader2 = BufReader::new(Cursor::new(&input));
-        let mode1 = SamplingMode::Reservoir { count: 10, seed: 42 };
-        let mode2 = SamplingMode::Reservoir { count: 10, seed: 42 };
+        let mode1 = SamplingMode::Reservoir {
+            count: 10,
+            seed: 42,
+        };
+        let mode2 = SamplingMode::Reservoir {
+            count: 10,
+            seed: 42,
+        };
         let mut output1 = Vec::new();
         let mut output2 = Vec::new();
 
@@ -737,8 +879,16 @@ mod tests {
         let reader2 = BufReader::new(Cursor::new(&input));
         let regex1 = Regex::new(r"\[INFO\]").unwrap();
         let regex2 = Regex::new(r"\[INFO\]").unwrap();
-        let mode1 = SamplingMode::RateStratified { rate: 0.5, seed: 42, regex: regex1 };
-        let mode2 = SamplingMode::RateStratified { rate: 0.5, seed: 42, regex: regex2 };
+        let mode1 = SamplingMode::RateStratified {
+            rate: 0.5,
+            seed: 42,
+            regex: regex1,
+        };
+        let mode2 = SamplingMode::RateStratified {
+            rate: 0.5,
+            seed: 42,
+            regex: regex2,
+        };
         let mut output1 = Vec::new();
         let mut output2 = Vec::new();
 
@@ -761,7 +911,11 @@ mod tests {
         "};
         let reader = BufReader::new(Cursor::new(input));
         let regex = Regex::new(r"\[(INFO|ERROR)\]").unwrap();
-        let mode = SamplingMode::RateStratified { rate: 0.5, seed: 42, regex };
+        let mode = SamplingMode::RateStratified {
+            rate: 0.5,
+            seed: 42,
+            regex,
+        };
         let mut output = Vec::new();
 
         let stats = mode.sample(reader, &mut output).unwrap();
@@ -788,13 +942,13 @@ mod tests {
         "};
         let reader = BufReader::new(Cursor::new(input));
         let regex = Regex::new(r"\[(INFO|ERROR)\]").unwrap();
-        let mode = SamplingMode::EveryStratified { n: 1, regex };  // Sample every line
+        let mode = SamplingMode::EveryStratified { n: 1, regex }; // Sample every line
         let mut output = Vec::new();
 
         let stats = mode.sample(reader, &mut output).unwrap();
 
         assert_eq!(stats.lines_read, 4);
-        assert_eq!(stats.lines_output, 4);  // All lines should be sampled
+        assert_eq!(stats.lines_output, 4); // All lines should be sampled
 
         // Check strata breakdown
         let strata = stats.strata_stats.as_ref().unwrap();
@@ -802,5 +956,115 @@ mod tests {
         assert!(strata.contains_key("[ERROR]"));
         assert!(strata.contains_key("unmatched"));
         assert_eq!(strata["unmatched"].lines_read, 2);
+    }
+
+    #[test]
+    fn test_parse_duration_valid() {
+        // Seconds
+        assert_eq!(parse_duration("1s").unwrap(), Duration::from_secs(1));
+        assert_eq!(parse_duration("1sec").unwrap(), Duration::from_secs(1));
+        assert_eq!(parse_duration("2seconds").unwrap(), Duration::from_secs(2));
+
+        // Milliseconds
+        assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+        assert_eq!(parse_duration("100ms").unwrap(), Duration::from_millis(100));
+
+        // Minutes (bonus from humantime)
+        assert_eq!(parse_duration("1m").unwrap(), Duration::from_secs(60));
+        assert_eq!(parse_duration("1min").unwrap(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_parse_duration_invalid() {
+        // Invalid format
+        assert!(parse_duration("abc").is_err());
+        assert!(parse_duration("").is_err());
+        assert!(parse_duration("notaduration").is_err());
+
+        // Zero duration should be rejected
+        assert!(parse_duration("0s").is_err());
+        assert!(parse_duration("0ms").is_err());
+    }
+
+    #[test]
+    fn test_throttle_basic() {
+        let input = indoc! {"
+            line1
+            line2
+            line3
+            line4
+        "};
+        let reader = BufReader::new(Cursor::new(input));
+        let mode = SamplingMode::Throttle {
+            duration: Duration::from_millis(10),
+        };
+        let mut output = Vec::new();
+
+        let stats = mode.sample(reader, &mut output).unwrap();
+
+        // In tests, lines arrive instantly (no real time delay)
+        // So only the first line should output
+        let result = String::from_utf8(output).unwrap();
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines.len(), 1);
+        assert!(result.contains("line1"));
+        assert_eq!(stats.lines_read, 4);
+        assert_eq!(stats.lines_output, 1);
+    }
+
+    #[test]
+    fn test_throttle_stratified() {
+        let input = indoc! {"
+            [INFO] 1
+            [INFO] 2
+            [ERROR] 3
+            [ERROR] 4
+            [INFO] 5
+        "};
+        let reader = BufReader::new(Cursor::new(input));
+        let regex = Regex::new(r"\[(INFO|ERROR)\]").unwrap();
+        let mode = SamplingMode::ThrottleStratified {
+            duration: Duration::from_millis(10),
+            regex,
+        };
+        let mut output = Vec::new();
+
+        let stats = mode.sample(reader, &mut output).unwrap();
+
+        // In tests, lines arrive instantly
+        // First line of each stratum should output
+        let result = String::from_utf8(output).unwrap();
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines.len(), 2); // [INFO] 1, [ERROR] 3
+        assert!(result.contains("[INFO] 1"));
+        assert!(result.contains("[ERROR] 3"));
+        assert_eq!(stats.lines_read, 5);
+        assert_eq!(stats.lines_output, 2);
+
+        // Check strata breakdown
+        let strata = stats.strata_stats.as_ref().unwrap();
+        assert_eq!(strata["[INFO]"].lines_read, 3);
+        assert_eq!(strata["[INFO]"].lines_output, 1);
+        assert_eq!(strata["[ERROR]"].lines_read, 2);
+        assert_eq!(strata["[ERROR]"].lines_output, 1);
+    }
+
+    #[test]
+    fn test_throttle_single_line() {
+        let input = "single line\n";
+        let reader = BufReader::new(Cursor::new(input));
+        let mode = SamplingMode::Throttle {
+            duration: Duration::from_secs(1),
+        };
+        let mut output = Vec::new();
+
+        let stats = mode.sample(reader, &mut output).unwrap();
+
+        // Single line should always output
+        let result = String::from_utf8(output).unwrap();
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines, vec!["single line"]);
+        assert_eq!(stats.lines_read, 1);
+        assert_eq!(stats.lines_output, 1);
     }
 }
