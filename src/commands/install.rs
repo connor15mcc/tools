@@ -1,21 +1,15 @@
-use crate::command::{CommandRunner, COMMANDS};
 use anyhow::Result;
 use clap::Parser;
 
-#[derive(Parser)]
-#[command(name = "tools", about = "personal tools binary manager")]
-pub struct Tools {
-    /// Create symlinks for all commands (in the same directory as this binary)
-    #[arg(long)]
-    install: bool,
-}
+use crate::command::{CommandRunner, COMMANDS};
 
-impl CommandRunner for Tools {
+#[derive(Parser)]
+#[command(name = "install", about = "Install symlinks for all commands")]
+pub struct Install;
+
+impl CommandRunner for Install {
     fn run(self) -> Result<()> {
-        if self.install {
-            install_symlinks()?;
-        }
-        Ok(())
+        install_symlinks()
     }
 }
 
@@ -32,8 +26,8 @@ fn install_symlinks() -> Result<()> {
         let command = cmd.command();
         let name = command.get_name();
 
-        // Skip creating a symlink for "tools" itself
-        if name == "tools" {
+        // Skip creating a symlink for "install" itself
+        if name == "install" {
             continue;
         }
 

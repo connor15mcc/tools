@@ -7,10 +7,23 @@ mod commands;
 use command::COMMANDS;
 
 fn main() -> Result<()> {
+    // Detect how we were invoked (main binary vs symlink)
+    let argv0 = std::env::args()
+        .next()
+        .and_then(|arg0| {
+            std::path::Path::new(&arg0)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "tools".to_string());
+
+    let is_main_binary = argv0 == "tools";
+
     let mut app = ClapCommand::new("tools")
         .version(env!("CARGO_PKG_VERSION"))
         .about("personal tools binary manager")
-        .multicall(true)
+        .multicall(!is_main_binary) // Only use multicall mode for symlinks
         .arg_required_else_help(true);
 
     // Add all commands as subcommands, adding verbose flag to each
