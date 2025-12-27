@@ -1666,6 +1666,7 @@ dependencies = [
  "log",
  "petname",
  "quote",
+ "rand",
  "rayon",
  "regex",
  "resolve-path",
