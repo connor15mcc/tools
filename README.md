@@ -6,5 +6,5 @@ the main tools binary employs a busybox-style dispatch based on argv0. To
 install symlinks for each of the commands:
 
 ```
-cargo install --path=. && tools --install
+cargo install --path=. && tools install
 ```
