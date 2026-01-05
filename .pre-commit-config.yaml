@@ -1,0 +1,9 @@
+repos:
+  - repo: local
+    hooks:
+      - id: update-readme-help
+        name: Update README with usage-sync
+        entry: bash -c "usage-sync tools"
+        language: system
+        files: ^(src/|Cargo.toml)$
+        pass_filenames: false
