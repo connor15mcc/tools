@@ -30,7 +30,6 @@ Commands:
   ilimit      Interactively tail a limited number of lines
   petname     Generate a random petname
   notes       note-taking utility
-  pmr         Poor Man's Refactorator - batch apply changes across repos
   help        Print this message or the help of the given subcommand(s)
 
 Options:
