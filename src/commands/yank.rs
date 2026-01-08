@@ -1,0 +1,363 @@
+use std::{
+    env,
+    fs::File,
+    io::{self, BufRead, BufReader, Write},
+    path::PathBuf,
+    process::Command,
+};
+
+use anyhow::Result;
+use clap::Parser;
+use indoc::indoc;
+
+use crate::command::CommandRunner;
+
+#[derive(Parser)]
+#[command(
+    name = "yank",
+    about = "Copy command and its output to clipboard",
+    long_about = indoc! {"
+        Passes stdin through to stdout while capturing both
+        the parent shell command and output to clipboard.
+
+        Requirements for accurate command detection:
+        Enable immediate history writing in your shell:
+        - Zsh: Add 'setopt inc_append_history' to ~/.zshrc
+        - Bash: Add 'shopt -s histappend' and 'PROMPT_COMMAND=\"history -a\"' to ~/.bashrc
+
+        Then restart your shell or run: source ~/.zshrc (or ~/.bashrc)
+    "},
+    after_help = indoc! {"
+        Examples:
+          cat foo.txt | yank
+          git status | yank
+          ls -la | grep test | yank
+    "}
+)]
+pub struct Yank;
+
+impl CommandRunner for Yank {
+    fn run(self) -> Result<()> {
+        let output_lines = read_and_echo_stdin()?;
+        log::debug!("Captured {} lines of output", output_lines.len());
+
+        check_and_warn_shell_settings();
+
+        let mut command = get_parent_command()?;
+        log::debug!("Detected command: {}", command);
+
+        command = strip_yank_suffix(&command);
+        log::debug!("Stripped command: {}", command);
+
+        let clipboard_text = format_clipboard_content(&command, &output_lines);
+        log::debug!("Formatted {} bytes for clipboard", clipboard_text.len());
+
+        copy_to_clipboard(&clipboard_text)?;
+        log::debug!("Successfully copied to clipboard");
+
+        Ok(())
+    }
+}
+
+fn read_and_echo_stdin() -> Result<Vec<String>> {
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    let mut lines = Vec::new();
+
+    for line in stdin.lock().lines() {
+        let line = line?;
+        writeln!(stdout, "{}", line)?;
+        lines.push(line);
+    }
+
+    Ok(lines)
+}
+
+fn get_parent_command() -> Result<String> {
+    if let Ok(cmd) = read_from_history_file() {
+        return Ok(cmd);
+    }
+
+    anyhow::bail!(indoc! {"
+        Unable to detect parent command from shell history.
+
+        Details: Could not read history file.
+
+        For best results, enable immediate history writing:
+          - Zsh: Add 'setopt inc_append_history' to ~/.zshrc
+          - Bash: Add 'shopt -s histappend' and 'PROMPT_COMMAND=\"history -a\"' to your ~/.bashrc
+
+        Then restart your shell or run: source ~/.zshrc (or ~/.bashrc)
+    "})
+}
+
+fn read_from_history_file() -> Result<String> {
+    let history_path = if let Ok(histfile) = env::var("HISTFILE") {
+        log::debug!("Using HISTFILE from environment: {}", histfile);
+        PathBuf::from(histfile)
+    } else {
+        let path = detect_default_history_path()?;
+        log::debug!("Using detected default history path: {:?}", path);
+        path
+    };
+
+    if !history_path.exists() {
+        log::debug!("History file does not exist: {:?}", history_path);
+        anyhow::bail!("History file does not exist");
+    }
+
+    log::debug!("Reading last command from history file: {:?}", history_path);
+
+    let file = File::open(&history_path)?;
+    let reader = BufReader::new(file);
+
+    let last_line = reader
+        .lines()
+        .map_while(|l| l.ok())
+        .filter(|l| !l.trim().is_empty())
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("History file is empty"))?;
+
+    log::debug!("Raw history line: {}", last_line);
+
+    let parsed = parse_history_line(&last_line);
+    log::debug!("Parsed command: {}", parsed);
+
+    Ok(parsed)
+}
+
+fn detect_default_history_path() -> Result<PathBuf> {
+    let home =
+        env::var("HOME").map_err(|_| anyhow::anyhow!("HOME environment variable not set"))?;
+
+    let shell = env::var("SHELL").unwrap_or_default();
+    log::debug!("Detected shell: {}", shell);
+
+    let history_file = if shell.contains("zsh") {
+        ".zsh_history"
+    } else if shell.contains("bash") {
+        ".bash_history"
+    } else {
+        ".sh_history"
+    };
+
+    Ok(PathBuf::from(home).join(history_file))
+}
+
+fn parse_history_line(line: &str) -> String {
+    // Zsh format: ": 1234567890:0;command"
+    // Bash format: "command"
+    if line.starts_with(':') {
+        if let Some(semicolon_pos) = line.find(';') {
+            return line[semicolon_pos + 1..].to_string();
+        }
+    }
+    line.to_string()
+}
+
+fn format_clipboard_content(command: &str, output_lines: &[String]) -> String {
+    let mut result = format!("$ {}\n", command);
+    for line in output_lines {
+        result.push_str(line);
+        result.push('\n');
+    }
+    result
+}
+
+fn strip_yank_suffix(command: &str) -> String {
+    if let Some(last_pipe_pos) = command.rfind('|') {
+        return command[..last_pipe_pos].trim_end().to_string();
+    }
+    command.to_string()
+}
+
+fn is_zsh_inc_append_history_enabled() -> bool {
+    // For now, assume enabled if using zsh, since checking interactively is hard
+    true
+}
+
+fn is_bash_history_immediate() -> bool {
+    let histappend = Command::new("bash")
+        .arg("-i")
+        .arg("-c")
+        .arg("shopt -p histappend 2>/dev/null")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.contains("shopt -s histappend"))
+        .unwrap_or(false);
+
+    let prompt_cmd = env::var("PROMPT_COMMAND").unwrap_or_default();
+    let has_history_a = prompt_cmd.contains("history -a");
+
+    histappend && has_history_a
+}
+
+fn check_and_warn_shell_settings() {
+    let shell = env::var("SHELL").unwrap_or_default();
+    let enabled = if shell.contains("zsh") {
+        is_zsh_inc_append_history_enabled()
+    } else if shell.contains("bash") {
+        is_bash_history_immediate()
+    } else {
+        true
+    };
+
+    log::debug!("Shell immediate history enabled: {}", enabled);
+
+    if !enabled {
+        print_shell_warning();
+    }
+}
+
+fn print_shell_warning() {
+    eprintln!(
+        "Warning: Shell history immediate-write is not enabled.\n\
+         The captured command may be the PREVIOUS command, not the current one.\n\n\
+         For best results:\n\
+           - Zsh: Add 'setopt inc_append_history' to your ~/.zshrc\n\
+           - Bash: Add 'shopt -s histappend' and 'PROMPT_COMMAND=\"history -a\"' to your ~/.bashrc\n\n\
+         Then restart your shell or run: source ~/.zshrc (or ~/.bashrc)\n"
+    );
+}
+
+fn copy_to_clipboard(text: &str) -> Result<()> {
+    use arboard::Clipboard;
+
+    let mut clipboard =
+        Clipboard::new().map_err(|e| anyhow::anyhow!("Failed to access clipboard: {}", e))?;
+
+    clipboard
+        .set_text(text)
+        .map_err(|e| anyhow::anyhow!("Failed to copy to clipboard: {}", e))?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_zsh_history_line() {
+        let line = ": 1234567890:0;cat foo.txt | grep bar";
+        assert_eq!(parse_history_line(line), "cat foo.txt | grep bar");
+    }
+
+    #[test]
+    fn test_parse_zsh_history_line_with_complex_timestamp() {
+        let line = ": 1704729600:123;echo 'hello world' | yank";
+        assert_eq!(parse_history_line(line), "echo 'hello world' | yank");
+    }
+
+    #[test]
+    fn test_parse_bash_history_line() {
+        let line = "cat foo.txt | grep bar";
+        assert_eq!(parse_history_line(line), "cat foo.txt | grep bar");
+    }
+
+    #[test]
+    fn test_parse_history_line_with_special_chars() {
+        let line = "echo 'test with \"quotes\"' && ls -la";
+        assert_eq!(
+            parse_history_line(line),
+            "echo 'test with \"quotes\"' && ls -la"
+        );
+    }
+
+    #[test]
+    fn test_format_clipboard_content_single_line() {
+        let cmd = "echo hello";
+        let output = vec!["hello".to_string()];
+        let result = format_clipboard_content(cmd, &output);
+        assert_eq!(result, "$ echo hello\nhello\n");
+    }
+
+    #[test]
+    fn test_format_clipboard_content_multiple_lines() {
+        let cmd = "cat file.txt";
+        let output = vec![
+            "line 1".to_string(),
+            "line 2".to_string(),
+            "line 3".to_string(),
+        ];
+        let result = format_clipboard_content(cmd, &output);
+        assert_eq!(result, "$ cat file.txt\nline 1\nline 2\nline 3\n");
+    }
+
+    #[test]
+    fn test_format_clipboard_content_empty_output() {
+        let cmd = "true";
+        let output: Vec<String> = vec![];
+        let result = format_clipboard_content(cmd, &output);
+        assert_eq!(result, "$ true\n");
+    }
+
+    #[test]
+    fn test_format_clipboard_content_with_pipe() {
+        let cmd = "cat foo.txt | grep bar";
+        let output = vec!["matched line".to_string()];
+        let result = format_clipboard_content(cmd, &output);
+        assert_eq!(result, "$ cat foo.txt | grep bar\nmatched line\n");
+    }
+
+    #[test]
+    fn test_strip_yank_suffix_basic() {
+        assert_eq!(strip_yank_suffix("cat foo.txt | yank"), "cat foo.txt");
+    }
+
+    #[test]
+    fn test_strip_yank_suffix_with_flags() {
+        assert_eq!(strip_yank_suffix("cat foo.txt | yank -v"), "cat foo.txt");
+    }
+
+    #[test]
+    fn test_strip_yank_suffix_multi_pipe() {
+        assert_eq!(
+            strip_yank_suffix("cat foo.txt | grep bar | yank"),
+            "cat foo.txt | grep bar"
+        );
+    }
+
+    #[test]
+    fn test_strip_yank_suffix_quoted_pipe() {
+        assert_eq!(
+            strip_yank_suffix("echo 'hello | world' | yank"),
+            "echo 'hello | world'"
+        );
+    }
+
+    #[test]
+    fn test_strip_yank_suffix_no_yank() {
+        // Now strips everything after last pipe, even if it's not "yank"
+        assert_eq!(strip_yank_suffix("cat foo.txt | grep bar"), "cat foo.txt");
+    }
+
+    #[test]
+    fn test_strip_yank_suffix_no_pipe() {
+        assert_eq!(strip_yank_suffix("cat foo.txt"), "cat foo.txt");
+    }
+
+    #[test]
+    fn test_strip_yank_suffix_yank_in_middle() {
+        // "yank" in middle is fine, only strips after the last pipe
+        assert_eq!(strip_yank_suffix("cat yank.txt | grep bar"), "cat yank.txt");
+    }
+
+    #[test]
+    fn test_strip_yank_suffix_cargo_run() {
+        // Works with cargo run invocation too
+        assert_eq!(
+            strip_yank_suffix("echo 'foo' | cargo run -- yank"),
+            "echo 'foo'"
+        );
+    }
+
+    #[test]
+    fn test_strip_yank_suffix_whitespace_variations() {
+        assert_eq!(strip_yank_suffix("cat foo.txt|yank"), "cat foo.txt");
+        assert_eq!(strip_yank_suffix("cat foo.txt |yank"), "cat foo.txt");
+        assert_eq!(strip_yank_suffix("cat foo.txt | yank"), "cat foo.txt");
+        assert_eq!(strip_yank_suffix("cat foo.txt  |  yank"), "cat foo.txt");
+    }
+}
