@@ -3,6 +3,7 @@ use clap::{Arg, ArgAction, Command as ClapCommand};
 
 mod command;
 mod commands;
+mod languages;
 
 use command::COMMANDS;
 
