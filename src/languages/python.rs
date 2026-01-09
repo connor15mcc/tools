@@ -40,22 +40,29 @@ impl LanguageSupport for PythonSupport {
             || (node_text.starts_with("'''") && node_text.ends_with("'''"))
         {
             // string
-            if (new_content.starts_with('"') && new_content.ends_with('"'))
-                || (new_content.starts_with('\'') && new_content.ends_with('\''))
+            let trimmed = new_content.trim();
+            if (trimmed.starts_with('"') && trimmed.ends_with('"'))
+                || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
             {
-                new_content.to_string()
+                trimmed.to_string()
             } else {
-                format!(
-                    "\"{}\"",
-                    new_content.replace('"', "\\\"").replace('\'', "\\'")
-                )
+                format!("\"{}\"", trimmed.replace('"', "\\\"").replace('\'', "\\'"))
             }
         } else if node_text.chars().all(|c| c.is_ascii_digit()) {
             // integer
             new_content.trim().to_string()
         } else if node_text.starts_with('[') && node_text.ends_with(']') {
             // list
-            format!("[{}]", new_content.trim())
+            if new_content.contains('\n') {
+                let items: Vec<String> = new_content
+                    .lines()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                format!("[{}]", items.join(", "))
+            } else {
+                format!("[{}]", new_content.trim())
+            }
         } else {
             new_content.to_string()
         };

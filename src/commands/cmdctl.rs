@@ -1,7 +1,7 @@
+use std::{fs, process::Command};
+
 use clap::Parser;
 use regex::Regex;
-use std::fs;
-use std::process::Command;
 
 use crate::{
     command::CommandRunner,
@@ -134,7 +134,7 @@ fn traverse(
 fn execute_command(command: &str) -> anyhow::Result<String> {
     let output = Command::new("sh").arg("-c").arg(command).output()?;
     if output.status.success() {
-        Ok(String::from_utf8(output.stdout)?.trim().to_string())
+        Ok(String::from_utf8(output.stdout)?)
     } else {
         Err(anyhow::anyhow!(
             "Command failed: {}",
@@ -297,6 +297,57 @@ mod tests {
         let after = indoc! {r#"
             // $ echo "Hello, World!"
             const MESSAGE = "Hello, World!";
+        "#};
+        let temp_file = NamedTempFile::with_suffix(".js").unwrap();
+        fs::write(&temp_file, before).unwrap();
+        process_file(temp_file.path().to_str().unwrap()).unwrap();
+        let result = fs::read_to_string(&temp_file).unwrap();
+        assert_eq!(result.trim(), after.trim());
+    }
+
+    #[test]
+    fn test_python_multiline_list() {
+        let before = indoc! {r#"
+            # $ seq 1 3 | sed 's/.*/"&"/'
+            ITEMS = []
+        "#};
+        let after = indoc! {r#"
+            # $ seq 1 3 | sed 's/.*/"&"/'
+            ITEMS = ["1", "2", "3"]
+        "#};
+        let temp_file = NamedTempFile::with_suffix(".py").unwrap();
+        fs::write(&temp_file, before).unwrap();
+        process_file(temp_file.path().to_str().unwrap()).unwrap();
+        let result = fs::read_to_string(&temp_file).unwrap();
+        assert_eq!(result.trim(), after.trim());
+    }
+
+    #[test]
+    fn test_rust_multiline_list() {
+        let before = indoc! {r#"
+            // $ seq 1 3 | sed 's/.*/"&"/'
+            const ITEMS: [String; 3] = [];
+        "#};
+        let after = indoc! {r#"
+            // $ seq 1 3 | sed 's/.*/"&"/'
+            const ITEMS: [String; 3] = ["1", "2", "3"];
+        "#};
+        let temp_file = NamedTempFile::with_suffix(".rs").unwrap();
+        fs::write(&temp_file, before).unwrap();
+        process_file(temp_file.path().to_str().unwrap()).unwrap();
+        let result = fs::read_to_string(&temp_file).unwrap();
+        assert_eq!(result.trim(), after.trim());
+    }
+
+    #[test]
+    fn test_js_multiline_list() {
+        let before = indoc! {r#"
+            // $ seq 1 3 | sed 's/.*/"&"/'
+            const ITEMS = [];
+        "#};
+        let after = indoc! {r#"
+            // $ seq 1 3 | sed 's/.*/"&"/'
+            const ITEMS = ["1", "2", "3"];
         "#};
         let temp_file = NamedTempFile::with_suffix(".js").unwrap();
         fs::write(&temp_file, before).unwrap();
