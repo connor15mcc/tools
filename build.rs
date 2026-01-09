@@ -9,15 +9,15 @@ struct CommandInfo {
     module_name: String,
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let commands_dir = Path::new("src/commands");
     let out_file = commands_dir.join("generated.rs");
 
     let mut commands = Vec::new();
 
     if commands_dir.exists() {
-        for entry in fs::read_dir(commands_dir).unwrap() {
-            let entry = entry.unwrap();
+        for entry in fs::read_dir(commands_dir)? {
+            let entry = entry?;
             let path = entry.path();
 
             if path.extension().and_then(|s| s.to_str()) == Some("rs") {
@@ -27,13 +27,12 @@ fn main() {
                     continue;
                 }
 
-                if let Ok(file_commands) = find_commands_in_file(&path) {
-                    for struct_name in file_commands {
-                        commands.push(CommandInfo {
-                            struct_name,
-                            module_name: module_name.to_string(),
-                        });
-                    }
+                let file_commands = find_commands_in_file(&path)?;
+                for struct_name in file_commands {
+                    commands.push(CommandInfo {
+                        struct_name,
+                        module_name: module_name.to_string(),
+                    });
                 }
             }
         }
@@ -41,10 +40,12 @@ fn main() {
 
     // Generate the registration code
     let generated = generate_code(&commands);
-    fs::write(&out_file, generated).unwrap();
+    fs::write(&out_file, generated)?;
 
     // Tell cargo to rerun if commands directory changes
     println!("cargo:rerun-if-changed=src/commands");
+
+    Ok(())
 }
 
 fn find_commands_in_file(path: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
