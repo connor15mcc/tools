@@ -2,7 +2,7 @@ use std::{
     env,
     fs::File,
     io::{self, BufRead, BufReader, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
 };
 
@@ -34,7 +34,15 @@ use crate::command::CommandRunner;
           ls -la | grep test | yank
     "}
 )]
-pub struct Yank;
+pub struct Yank {
+    /// Command prompt marker
+    #[arg(long, default_value = "$")]
+    prompt: String,
+
+    /// Include current working directory in the prompt
+    #[arg(long)]
+    cwd: bool,
+}
 
 impl CommandRunner for Yank {
     fn run(self) -> Result<()> {
@@ -49,7 +57,8 @@ impl CommandRunner for Yank {
         command = strip_yank_suffix(&command);
         log::debug!("Stripped command: {}", command);
 
-        let clipboard_text = format_clipboard_content(&command, &output_lines);
+        let clipboard_text =
+            format_clipboard_content(&command, &output_lines, &self.prompt, self.cwd);
         log::debug!("Formatted {} bytes for clipboard", clipboard_text.len());
 
         copy_to_clipboard(&clipboard_text)?;
@@ -155,8 +164,33 @@ fn parse_history_line(line: &str) -> String {
     line.to_string()
 }
 
-fn format_clipboard_content(command: &str, output_lines: &[String]) -> String {
-    let mut result = format!("$ {}\n", command);
+fn relativize_path(path: &Path) -> String {
+    if let Ok(home) = env::var("HOME") {
+        let home_path = Path::new(&home);
+        if let Ok(rel) = path.strip_prefix(home_path) {
+            return format!("~/{}", rel.display());
+        }
+    }
+    path.display().to_string()
+}
+
+fn format_clipboard_content(
+    command: &str,
+    output_lines: &[String],
+    prompt: &str,
+    cwd: bool,
+) -> String {
+    let marker = if cwd {
+        if let Ok(current_dir) = env::current_dir() {
+            format!("{} {} ", relativize_path(&current_dir), prompt)
+        } else {
+            format!("{} ", prompt)
+        }
+    } else {
+        format!("{} ", prompt)
+    };
+
+    let mut result = format!("{}{}\n", marker, command);
     for line in output_lines {
         result.push_str(line);
         result.push('\n');
@@ -269,7 +303,7 @@ mod tests {
     fn test_format_clipboard_content_single_line() {
         let cmd = "echo hello";
         let output = vec!["hello".to_string()];
-        let result = format_clipboard_content(cmd, &output);
+        let result = format_clipboard_content(cmd, &output, "$", false);
         assert_eq!(result, "$ echo hello\nhello\n");
     }
 
@@ -281,7 +315,7 @@ mod tests {
             "line 2".to_string(),
             "line 3".to_string(),
         ];
-        let result = format_clipboard_content(cmd, &output);
+        let result = format_clipboard_content(cmd, &output, "$", false);
         assert_eq!(result, "$ cat file.txt\nline 1\nline 2\nline 3\n");
     }
 
@@ -289,7 +323,7 @@ mod tests {
     fn test_format_clipboard_content_empty_output() {
         let cmd = "true";
         let output: Vec<String> = vec![];
-        let result = format_clipboard_content(cmd, &output);
+        let result = format_clipboard_content(cmd, &output, "$", false);
         assert_eq!(result, "$ true\n");
     }
 
@@ -297,7 +331,7 @@ mod tests {
     fn test_format_clipboard_content_with_pipe() {
         let cmd = "cat foo.txt | grep bar";
         let output = vec!["matched line".to_string()];
-        let result = format_clipboard_content(cmd, &output);
+        let result = format_clipboard_content(cmd, &output, "$", false);
         assert_eq!(result, "$ cat foo.txt | grep bar\nmatched line\n");
     }
 
