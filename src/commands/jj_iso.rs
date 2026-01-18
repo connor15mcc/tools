@@ -1,3 +1,5 @@
+use std::fs::create_dir_all;
+
 use anyhow::Context;
 use clap::Parser;
 use petname::{Generator, Petnames};
@@ -47,6 +49,8 @@ impl CommandRunner for JjIso {
         let ws_path = tmpdir.join(&repo_name).join(&ws_name);
 
         // Add JJ workspace
+        create_dir_all(ws_path.parent().expect("is already nested"))
+            .context("failed to create workspace dir")?;
         let ws_path_str = ws_path.to_string_lossy().to_string();
         cmd!(sh, "jj workspace add {ws_path_str}").run()?;
 
