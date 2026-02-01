@@ -20,11 +20,12 @@ Usage: tools [COMMAND]
 Commands:
   hist        Generate a text-based histogram from numerical data
   decay       Calculate decay score from timestamps
+  yank        Copy command and its output to clipboard
   gh-review   Review GitHub PRs from a search query or team config
   install     Install symlinks for all commands
+  jj-iso      Create a random JJ workspace and launch a specified binary
   gomodmerge  Tidy merged go.mod and go.sum files
-  usage-sync  Sync --help output of a command to README.md between marker comments or infer from
-              placeholders
+  usage-sync  Sync --help output of a command to README.md between marker comments
   mdflow      Reflow markdown text
   sample      Sample lines from input using various strategies
   ilimit      Interactively tail a limited number of lines

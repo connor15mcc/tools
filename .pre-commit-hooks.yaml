@@ -1,0 +1,6 @@
+- id: usage-sync
+  name: Sync usage text to README.md
+  entry: tools
+  args: usage-sync
+  language: rust
+  pass_filenames: false
