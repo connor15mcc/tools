@@ -1,8 +1,7 @@
 use std::{
     env,
-    fs::File,
-    io::{self, BufRead, BufReader, Write},
-    path::{Path, PathBuf},
+    io::{self, BufRead, Write},
+    path::Path,
     process::Command,
 };
 
@@ -20,12 +19,8 @@ use crate::command::CommandRunner;
         Passes stdin through to stdout while capturing both
         the parent shell command and output to clipboard.
 
-        Requirements for accurate command detection:
-        Enable immediate history writing in your shell:
-        - Zsh: Add 'setopt inc_append_history' to ~/.zshrc
-        - Bash: Add 'shopt -s histappend' and 'PROMPT_COMMAND=\"history -a\"' to ~/.bashrc
-
-        Then restart your shell or run: source ~/.zshrc (or ~/.bashrc)
+        Requirements:
+        - Atuin must be installed and configured (https://atuin.sh)
     "},
     after_help = indoc! {"
         Examples:
@@ -48,8 +43,6 @@ impl CommandRunner for Yank {
     fn run(self) -> Result<()> {
         let output_lines = read_and_echo_stdin()?;
         log::debug!("Captured {} lines of output", output_lines.len());
-
-        check_and_warn_shell_settings();
 
         let mut command = get_parent_command()?;
         log::debug!("Detected command: {}", command);
@@ -83,85 +76,60 @@ fn read_and_echo_stdin() -> Result<Vec<String>> {
 }
 
 fn get_parent_command() -> Result<String> {
-    if let Ok(cmd) = read_from_history_file() {
-        return Ok(cmd);
-    }
+    get_command_from_atuin().map_err(|e| {
+        anyhow::anyhow!(
+            indoc! {"
+            Unable to detect parent command from atuin.
 
-    anyhow::bail!(indoc! {"
-        Unable to detect parent command from shell history.
+            Details: {}
 
-        Details: Could not read history file.
+            Requirements:
+              - Install atuin: https://atuin.sh
+              - Configure atuin for your shell (see atuin docs)
+              - Make sure atuin is tracking your shell history
 
-        For best results, enable immediate history writing:
-          - Zsh: Add 'setopt inc_append_history' to ~/.zshrc
-          - Bash: Add 'shopt -s histappend' and 'PROMPT_COMMAND=\"history -a\"' to your ~/.bashrc
-
-        Then restart your shell or run: source ~/.zshrc (or ~/.bashrc)
-    "})
+            You can verify atuin is working by running:
+              atuin history last --cmd-only
+        "},
+            e
+        )
+    })
 }
 
-fn read_from_history_file() -> Result<String> {
-    let history_path = if let Ok(histfile) = env::var("HISTFILE") {
-        log::debug!("Using HISTFILE from environment: {}", histfile);
-        PathBuf::from(histfile)
-    } else {
-        let path = detect_default_history_path()?;
-        log::debug!("Using detected default history path: {:?}", path);
-        path
-    };
+fn get_command_from_atuin() -> Result<String> {
+    log::debug!("Fetching last command from atuin");
 
-    if !history_path.exists() {
-        log::debug!("History file does not exist: {:?}", history_path);
-        anyhow::bail!("History file does not exist");
+    let output = Command::new("atuin")
+        .arg("history")
+        .arg("last")
+        .arg("--cmd-only")
+        .output()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                anyhow::anyhow!(
+                    "atuin command not found. Please install atuin from https://atuin.sh"
+                )
+            } else {
+                anyhow::anyhow!("Failed to execute atuin: {}", e)
+            }
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("atuin command failed: {}", stderr.trim());
     }
 
-    log::debug!("Reading last command from history file: {:?}", history_path);
+    let command = String::from_utf8(output.stdout)
+        .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in atuin output: {}", e))?;
 
-    let file = File::open(&history_path)?;
-    let reader = BufReader::new(file);
+    let command = command.trim().to_string();
 
-    let last_line = reader
-        .lines()
-        .map_while(|l| l.ok())
-        .filter(|l| !l.trim().is_empty())
-        .last()
-        .ok_or_else(|| anyhow::anyhow!("History file is empty"))?;
-
-    log::debug!("Raw history line: {}", last_line);
-
-    let parsed = parse_history_line(&last_line);
-    log::debug!("Parsed command: {}", parsed);
-
-    Ok(parsed)
-}
-
-fn detect_default_history_path() -> Result<PathBuf> {
-    let home =
-        env::var("HOME").map_err(|_| anyhow::anyhow!("HOME environment variable not set"))?;
-
-    let shell = env::var("SHELL").unwrap_or_default();
-    log::debug!("Detected shell: {}", shell);
-
-    let history_file = if shell.contains("zsh") {
-        ".zsh_history"
-    } else if shell.contains("bash") {
-        ".bash_history"
-    } else {
-        ".sh_history"
-    };
-
-    Ok(PathBuf::from(home).join(history_file))
-}
-
-fn parse_history_line(line: &str) -> String {
-    // Zsh format: ": 1234567890:0;command"
-    // Bash format: "command"
-    if line.starts_with(':') {
-        if let Some(semicolon_pos) = line.find(';') {
-            return line[semicolon_pos + 1..].to_string();
-        }
+    if command.is_empty() {
+        anyhow::bail!("atuin returned empty command history");
     }
-    line.to_string()
+
+    log::debug!("Retrieved command from atuin: {}", command);
+    Ok(command)
 }
 
 fn relativize_path(path: &Path) -> String {
@@ -205,56 +173,6 @@ fn strip_yank_suffix(command: &str) -> String {
     command.to_string()
 }
 
-fn is_zsh_inc_append_history_enabled() -> bool {
-    // For now, assume enabled if using zsh, since checking interactively is hard
-    true
-}
-
-fn is_bash_history_immediate() -> bool {
-    let histappend = Command::new("bash")
-        .arg("-i")
-        .arg("-c")
-        .arg("shopt -p histappend 2>/dev/null")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.contains("shopt -s histappend"))
-        .unwrap_or(false);
-
-    let prompt_cmd = env::var("PROMPT_COMMAND").unwrap_or_default();
-    let has_history_a = prompt_cmd.contains("history -a");
-
-    histappend && has_history_a
-}
-
-fn check_and_warn_shell_settings() {
-    let shell = env::var("SHELL").unwrap_or_default();
-    let enabled = if shell.contains("zsh") {
-        is_zsh_inc_append_history_enabled()
-    } else if shell.contains("bash") {
-        is_bash_history_immediate()
-    } else {
-        true
-    };
-
-    log::debug!("Shell immediate history enabled: {}", enabled);
-
-    if !enabled {
-        print_shell_warning();
-    }
-}
-
-fn print_shell_warning() {
-    eprintln!(
-        "Warning: Shell history immediate-write is not enabled.\n\
-         The captured command may be the PREVIOUS command, not the current one.\n\n\
-         For best results:\n\
-           - Zsh: Add 'setopt inc_append_history' to your ~/.zshrc\n\
-           - Bash: Add 'shopt -s histappend' and 'PROMPT_COMMAND=\"history -a\"' to your ~/.bashrc\n\n\
-         Then restart your shell or run: source ~/.zshrc (or ~/.bashrc)\n"
-    );
-}
-
 fn copy_to_clipboard(text: &str) -> Result<()> {
     use arboard::Clipboard;
 
@@ -271,33 +189,6 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse_zsh_history_line() {
-        let line = ": 1234567890:0;cat foo.txt | grep bar";
-        assert_eq!(parse_history_line(line), "cat foo.txt | grep bar");
-    }
-
-    #[test]
-    fn test_parse_zsh_history_line_with_complex_timestamp() {
-        let line = ": 1704729600:123;echo 'hello world' | yank";
-        assert_eq!(parse_history_line(line), "echo 'hello world' | yank");
-    }
-
-    #[test]
-    fn test_parse_bash_history_line() {
-        let line = "cat foo.txt | grep bar";
-        assert_eq!(parse_history_line(line), "cat foo.txt | grep bar");
-    }
-
-    #[test]
-    fn test_parse_history_line_with_special_chars() {
-        let line = "echo 'test with \"quotes\"' && ls -la";
-        assert_eq!(
-            parse_history_line(line),
-            "echo 'test with \"quotes\"' && ls -la"
-        );
-    }
 
     #[test]
     fn test_format_clipboard_content_single_line() {
