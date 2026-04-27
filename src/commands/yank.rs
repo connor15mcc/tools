@@ -19,8 +19,16 @@ use crate::command::CommandRunner;
         Passes stdin through to stdout while capturing both
         the parent shell command and output to clipboard.
 
-        Requirements:
-        - Atuin must be installed and configured (https://atuin.sh)
+        Command detection (in priority order):
+        1. $YANK_COMMANDLINE env var (set by the fish wrapper function)
+        2. Atuin history (fallback for non-fish shells)
+
+        For fish, add ~/.config/fish/functions/yank.fish:
+
+          function yank
+              set -x YANK_COMMANDLINE (status current-commandline)
+              command yank $argv
+          end
     "},
     after_help = indoc! {"
         Examples:
@@ -76,24 +84,42 @@ fn read_and_echo_stdin() -> Result<Vec<String>> {
 }
 
 fn get_parent_command() -> Result<String> {
+    if let Ok(cmd) = get_command_from_env() {
+        return Ok(cmd);
+    }
+
     get_command_from_atuin().map_err(|e| {
         anyhow::anyhow!(
             indoc! {"
-            Unable to detect parent command from atuin.
+            Unable to detect parent command.
 
             Details: {}
 
-            Requirements:
-              - Install atuin: https://atuin.sh
-              - Configure atuin for your shell (see atuin docs)
-              - Make sure atuin is tracking your shell history
+            For fish, add a wrapper function (~/.config/fish/functions/yank.fish):
 
-            You can verify atuin is working by running:
-              atuin history last --cmd-only
+              function yank
+                  set -x YANK_COMMANDLINE (status current-commandline)
+                  command yank $argv
+              end
+
+            For other shells, install atuin (https://atuin.sh) as a fallback.
         "},
             e
         )
     })
+}
+
+fn get_command_from_env() -> Result<String> {
+    let cmd =
+        env::var("YANK_COMMANDLINE").map_err(|_| anyhow::anyhow!("YANK_COMMANDLINE not set"))?;
+
+    let cmd = cmd.trim().to_string();
+    if cmd.is_empty() {
+        anyhow::bail!("YANK_COMMANDLINE is empty");
+    }
+
+    log::debug!("Retrieved command from YANK_COMMANDLINE: {}", cmd);
+    Ok(cmd)
 }
 
 fn get_command_from_atuin() -> Result<String> {
