@@ -16,34 +16,61 @@ pub struct Align {
 impl CommandRunner for Align {
     fn run(self) -> anyhow::Result<()> {
         let re = Regex::new(&self.pattern).context("Invalid regex pattern")?;
+        let lines: Vec<String> = std::io::stdin().lock().lines().collect::<Result<_, _>>()?;
+        let output = Self::align(re, &lines);
+        println!("{}", output.join("\n"));
+        Ok(())
+    }
+}
 
-        let stdin = std::io::stdin();
-        let mut lines = Vec::new();
-
-        for line in stdin.lock().lines() {
-            lines.push(line?);
-        }
-
-        let max_end = lines
-            .iter()
-            .filter_map(|line| re.find(line).map(|m| m.end()))
-            .max()
-            .unwrap_or(0);
-
+impl Align {
+    fn align(re: Regex, lines: &[String]) -> Vec<String> {
+        let mut max_end: Vec<usize> = Vec::new();
         for line in lines {
-            if let Some(m) = re.find(&line) {
-                let match_start = m.start();
-                let match_end = m.end();
-                let padding = " ".repeat(max_end - match_end);
-                let before_match = &line[..match_start];
-                let after_match = &line[match_end..];
-                println!("{}{}{}{}", before_match, padding, m.as_str(), after_match);
-            } else {
-                println!("{}", line);
+            for (i, m) in re.find_iter(line).enumerate() {
+                if max_end.len() <= i {
+                    max_end.push(m.end());
+                } else if max_end[i] < m.end() {
+                    max_end[i] = m.end();
+                }
             }
         }
 
-        Ok(())
+        let mut output = Vec::new();
+        for line in lines {
+            let matches: Vec<_> = re.find_iter(line).collect();
+            if matches.is_empty() {
+                output.push(line.to_string());
+                continue;
+            }
+            let mut new_line = String::new();
+            let mut prev_end = 0;
+            let mut cumulative_padding = 0;
+            for (i, m) in matches.into_iter().enumerate() {
+                new_line.push_str(&line[prev_end..m.start()]);
+                // Padding needed so that padded match ends at column max_end[i]
+                let needed = max_end[i].saturating_sub(m.end() + cumulative_padding);
+                let padding = " ".repeat(needed);
+                new_line.push_str(&format!("{}{}", padding, m.as_str()));
+                cumulative_padding += needed;
+                prev_end = m.end();
+            }
+            new_line.push_str(&line[prev_end..]);
+            output.push(new_line);
+        }
+        output
+    }
+
+    #[cfg(test)]
+    fn align_str(pattern: &str, input: &str) -> String {
+        let re = Regex::new(pattern).unwrap();
+        let lines: Vec<String> = input.lines().map(str::to_string).collect();
+
+        let mut out = Self::align(re, &lines).join("\n");
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out
     }
 }
 
@@ -53,46 +80,13 @@ mod tests {
 
     use super::*;
 
-    fn run_align(pattern: &str, input: &str) -> String {
-        let re = Regex::new(pattern).unwrap();
-        let lines: Vec<&str> = input.lines().collect();
-
-        let max_end = lines
-            .iter()
-            .filter_map(|line| re.find(line).map(|m: regex::Match| m.end()))
-            .max()
-            .unwrap_or(0);
-
-        let mut output = String::new();
-        for line in lines {
-            if let Some(m) = re.find(line) {
-                let match_start = m.start();
-                let match_end = m.end();
-                let padding = " ".repeat(max_end - match_end);
-                let before_match = &line[..match_start];
-                let after_match = &line[match_end..];
-                output.push_str(&format!(
-                    "{}{}{}{}\n",
-                    before_match,
-                    padding,
-                    m.as_str(),
-                    after_match
-                ));
-            } else {
-                output.push_str(&format!("{}\n", line));
-            }
-        }
-
-        output
-    }
-
     #[test]
     fn test_align_on_equals() {
         let input = indoc! {"
             foo = bar
             baz = qux
         "};
-        let output = run_align("=", input);
+        let output = Align::align_str("=", input);
         assert_eq!(
             output,
             indoc! {"
@@ -108,7 +102,7 @@ mod tests {
             a = b
             longer = c
         "};
-        let output = run_align("=", input);
+        let output = Align::align_str("=", input);
         assert_eq!(
             output,
             indoc! {"
@@ -124,7 +118,7 @@ mod tests {
             key: value
             longkey: val
         "};
-        let output = run_align(":", input);
+        let output = Align::align_str(":", input);
         assert_eq!(
             output,
             indoc! {"
@@ -140,7 +134,7 @@ mod tests {
             foo bar
             baz qux
         "};
-        let output = run_align("=", input);
+        let output = Align::align_str("=", input);
         assert_eq!(
             output,
             indoc! {"
@@ -151,12 +145,28 @@ mod tests {
     }
 
     #[test]
+    fn test_align_with_repeats() {
+        let input = indoc! {"
+            foo = bar = baz = qux
+            testing = values = are = hard
+        "};
+        let output = Align::align_str("=", input);
+        assert_eq!(
+            output,
+            indoc! {"
+            foo     = bar    = baz = qux
+            testing = values = are = hard
+        "}
+        );
+    }
+
+    #[test]
     fn test_align_with_regex_metacharacters() {
         let input = indoc! {"
             a\\+b
             foo\\+bar
         "};
-        let output = run_align(r"\\+", input);
+        let output = Align::align_str(r"\\+", input);
         assert_eq!(
             output,
             indoc! {"
