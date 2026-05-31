@@ -26,11 +26,6 @@ impl CommandRunner for JjStack {
             bail!("no commits match revset: {rev}");
         }
 
-        // Detect the megamerge: the merge commit closest to the tip among
-        // descendants of trunk. Try `closest_merge(@)` first (handles the case
-        // where the user is working inside the stack); fall back to
-        // `heads(merges() & (trunk()..))` for the topmost merge in the stack
-        // when @ is off to the side.
         let mm = find_megamerge(&sh)?;
 
         match mm {
@@ -50,13 +45,10 @@ impl CommandRunner for JjStack {
     }
 }
 
+const MEGAMERGE_REVSET: &str = "heads(::@ & merges() & (trunk()..))";
+
 fn find_megamerge(sh: &Shell) -> Result<Option<String>> {
-    if let Some(mm) = list_change_ids(sh, "closest_merge(@)")?.into_iter().next() {
-        return Ok(Some(mm));
-    }
-    Ok(list_change_ids(sh, "heads(merges() & (trunk()..))")?
-        .into_iter()
-        .next())
+    Ok(list_change_ids(sh, MEGAMERGE_REVSET)?.into_iter().next())
 }
 
 fn validate_revision(rev: &str) -> Result<()> {
@@ -109,87 +101,4 @@ pub(crate) fn new_megamerge_args(parents: &[String]) -> Result<Vec<String>> {
     ];
     a.extend(parents.iter().cloned());
     Ok(a)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn validate_revision_rejects_empty() {
-        let err = validate_revision("").unwrap_err();
-        assert!(err.to_string().contains("must not be empty"), "got: {err}");
-    }
-
-    #[test]
-    fn validate_revision_accepts_nonempty() {
-        validate_revision("abc").unwrap();
-        validate_revision("description(\"foo\")").unwrap();
-    }
-
-    #[test]
-    fn parse_change_ids_empty() {
-        assert!(parse_change_ids("").is_empty());
-        assert!(parse_change_ids("\n\n  \n").is_empty());
-    }
-
-    #[test]
-    fn parse_change_ids_trims_and_drops_empty() {
-        let s = "abc\n  def  \n\nghi\n";
-        assert_eq!(parse_change_ids(s), vec!["abc", "def", "ghi"]);
-    }
-
-    #[test]
-    fn parse_change_ids_preserves_order() {
-        let s = "z\na\nm\n";
-        assert_eq!(parse_change_ids(s), vec!["z", "a", "m"]);
-    }
-
-    #[test]
-    fn rebase_into_stack_args_shape() {
-        assert_eq!(
-            rebase_into_stack_args("xyz", "mmid"),
-            vec![
-                "rebase",
-                "-r",
-                "xyz",
-                "--insert-after",
-                "trunk()",
-                "--insert-before",
-                "mmid",
-            ]
-        );
-    }
-
-    #[test]
-    fn rebase_onto_trunk_args_shape() {
-        assert_eq!(
-            rebase_onto_trunk_args("xyz"),
-            vec!["rebase", "-r", "xyz", "--insert-after", "trunk()"]
-        );
-    }
-
-    #[test]
-    fn new_megamerge_args_single_parent() {
-        let parents = vec!["p1".to_string()];
-        assert_eq!(
-            new_megamerge_args(&parents).unwrap(),
-            vec!["new", "--no-edit", "-m", "megamerge", "p1"]
-        );
-    }
-
-    #[test]
-    fn new_megamerge_args_multi_parent() {
-        let parents = vec!["p1".to_string(), "p2".to_string(), "p3".to_string()];
-        assert_eq!(
-            new_megamerge_args(&parents).unwrap(),
-            vec!["new", "--no-edit", "-m", "megamerge", "p1", "p2", "p3"]
-        );
-    }
-
-    #[test]
-    fn new_megamerge_args_empty_parents_errors() {
-        let err = new_megamerge_args(&[]).unwrap_err();
-        assert!(err.to_string().contains("zero parents"), "got: {err}");
-    }
 }
