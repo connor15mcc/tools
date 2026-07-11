@@ -34,10 +34,9 @@ impl CommandRunner for JjStack {
                 sh.cmd("jj").args(&args).run()?;
             }
             None => {
-                let args = rebase_onto_trunk_args(&rev);
+                let args = parallelize_args();
                 sh.cmd("jj").args(&args).run()?;
-                let parents = list_change_ids(&sh, "heads(trunk()..)")?;
-                let args = new_megamerge_args(&parents)?;
+                let args = new_megamerge_args();
                 sh.cmd("jj").args(&args).run()?;
             }
         }
@@ -85,20 +84,10 @@ pub(crate) fn rebase_into_stack_args<'a>(rev: &'a str, megamerge: &'a str) -> Ve
     ]
 }
 
-pub(crate) fn rebase_onto_trunk_args(rev: &str) -> Vec<&str> {
-    vec!["rebase", "-r", rev, "--insert-after", "trunk()"]
+pub(crate) fn parallelize_args() -> Vec<&'static str> {
+    vec!["parallelize", "trunk()..@-"]
 }
 
-pub(crate) fn new_megamerge_args(parents: &[String]) -> Result<Vec<String>> {
-    if parents.is_empty() {
-        bail!("cannot create megamerge with zero parents");
-    }
-    let mut a: Vec<String> = vec![
-        "new".into(),
-        "--no-edit".into(),
-        "-m".into(),
-        "megamerge".into(),
-    ];
-    a.extend(parents.iter().cloned());
-    Ok(a)
+pub(crate) fn new_megamerge_args() -> Vec<&'static str> {
+    vec!["commit", "-m", "megamerge"]
 }
