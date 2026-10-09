@@ -45,6 +45,10 @@ fn table_name_from_path(path: &Path) -> String {
     sanitize_table_name(stem)
 }
 
+fn read_json_expr(path: &str) -> String {
+    format!("read_json_auto('{path}', format='unstructured')")
+}
+
 impl CommandRunner for Jsonsql {
     fn run(self) -> Result<()> {
         match self.mode {
@@ -58,7 +62,7 @@ fn run_query(query: &str) -> Result<()> {
     let status = Command::new("duckdb")
         .args(["-noheader", "-list", "-separator", "\t"])
         .arg("-c")
-        .arg(format!("FROM read_json_auto('/dev/stdin') {query}"))
+        .arg(format!("FROM {} {query}", read_json_expr("/dev/stdin")))
         .status()
         .context("failed to run duckdb (is it installed and on PATH?)")?;
 
@@ -92,7 +96,8 @@ fn run_interactive(file: Option<PathBuf>) -> Result<()> {
     let status = Command::new("duckdb")
         .arg("-cmd")
         .arg(format!(
-            "CREATE TABLE \"{table}\" AS FROM read_json_auto('{file_str}')"
+            "CREATE TABLE \"{table}\" AS FROM {}",
+            read_json_expr(&file_str)
         ))
         .arg("-cmd")
         .arg(format!("DESCRIBE \"{table}\""))
@@ -151,6 +156,14 @@ mod tests {
     #[test]
     fn test_table_name_from_path_no_extension() {
         assert_eq!(table_name_from_path(Path::new("data")), "data");
+    }
+
+    #[test]
+    fn test_read_json_expr_uses_unstructured_format() {
+        assert_eq!(
+            read_json_expr("/tmp/a.json"),
+            "read_json_auto('/tmp/a.json', format='unstructured')"
+        );
     }
 
     #[test]
