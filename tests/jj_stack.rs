@@ -1,188 +1,8 @@
-use std::collections::BTreeSet;
-use std::ffi::OsStr;
+mod common;
+
 use std::fs;
-use std::path::Path;
-use std::process::{Command, Output};
 
-use tempfile::TempDir;
-
-struct Repo {
-    temp: TempDir,
-}
-
-impl Repo {
-    fn new() -> Self {
-        let repo = Self {
-            temp: tempfile::tempdir().unwrap(),
-        };
-        fs::create_dir(repo.root().join("home")).unwrap();
-        fs::write(
-            repo.root().join("config.toml"),
-            r#"
-[user]
-name = "Integration Test"
-email = "integration@example.invalid"
-[ui]
-color = "never"
-paginate = "never"
-[signing]
-behavior = "drop"
-"#,
-        )
-        .unwrap();
-        let version = repo.command("jj").arg("--version").output().expect(
-            "jj-stack integration tests require jj on PATH; install jj before running cargo test",
-        );
-        success(&["jj", "--version"], version);
-        repo.jj(&["git", "init", "--colocate", "repo"]);
-        repo.jj(&[
-            "config",
-            "set",
-            "--repo",
-            "revset-aliases.\"trunk()\"",
-            "bookmarks(exact:trunk)",
-        ]);
-        fs::write(repo.path().join("trunk.txt"), "trunk\n").unwrap();
-        repo.jj(&["describe", "-m", "trunk"]);
-        repo.jj(&["bookmark", "set", "trunk", "-r", "@"]);
-        repo
-    }
-
-    fn root(&self) -> &Path {
-        self.temp.path()
-    }
-
-    fn path(&self) -> std::path::PathBuf {
-        self.root().join("repo")
-    }
-
-    fn command(&self, program: impl AsRef<OsStr>) -> Command {
-        let mut cmd = Command::new(program);
-        // Apply to each subprocess, including the tools binary whose jj children
-        // inherit this environment. Never change the test process's environment.
-        for (key, _) in std::env::vars_os() {
-            if key.to_string_lossy().starts_with("JJ_") || key.to_string_lossy().starts_with("GIT_")
-            {
-                cmd.env_remove(key);
-            }
-        }
-        cmd.env("HOME", self.root().join("home"))
-            .env("XDG_CONFIG_HOME", self.root().join("home"))
-            .env("JJ_CONFIG", self.root().join("config.toml"))
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .current_dir(if self.path().exists() {
-                self.path()
-            } else {
-                self.root().to_path_buf()
-            });
-        cmd
-    }
-
-    fn jj(&self, args: &[&str]) -> String {
-        success(args, self.command("jj").args(args).output().unwrap())
-    }
-
-    fn stack(&self, revision: &str) -> Output {
-        self.command(env!("CARGO_BIN_EXE_tools"))
-            .args(["jj-stack", "-r", revision])
-            .output()
-            .unwrap()
-    }
-
-    fn stage(&self, revision: &str) {
-        success(&["jj-stack", "-r", revision], self.stack(revision));
-    }
-
-    fn ids(&self, revset: &str) -> BTreeSet<String> {
-        self.jj(&[
-            "log",
-            "--no-graph",
-            "-r",
-            revset,
-            "-T",
-            "change_id ++ \"\\n\"",
-        ])
-        .lines()
-        .map(String::from)
-        .collect()
-    }
-
-    fn id(&self, revset: &str) -> String {
-        let ids = self.ids(revset);
-        assert_eq!(ids.len(), 1, "expected one change for {revset}: {ids:?}");
-        ids.into_iter().next().unwrap()
-    }
-
-    fn parents(&self, revision: &str) -> BTreeSet<String> {
-        self.ids(&format!("({revision})-"))
-    }
-
-    fn assert_megamerge_description(&self, revision: &str) {
-        assert_eq!(
-            self.jj(&[
-                "log",
-                "--no-graph",
-                "-r",
-                revision,
-                "-T",
-                "description.first_line()",
-            ]),
-            "megamerge"
-        );
-        assert_eq!(
-            self.ids("description(substring:megamerge)"),
-            set(&[revision])
-        );
-    }
-
-    fn change(&self, parent: &str, name: &str) -> String {
-        self.jj(&["new", parent, "-m", name]);
-        fs::write(self.path().join(format!("{name}.txt")), format!("{name}\n")).unwrap();
-        self.id("@")
-    }
-
-    fn merge(&self, parents: &[&str], description: &str) -> String {
-        let mut args = vec!["new"];
-        args.extend_from_slice(parents);
-        args.extend(["-m", description]);
-        self.jj(&args);
-        let id = self.id("@");
-        self.jj(&["new"]);
-        id
-    }
-
-    fn snapshot(&self) -> (BTreeSet<String>, String) {
-        let commits = self
-            .jj(&[
-                "log",
-                "--no-graph",
-                "-r",
-                "all()",
-                "-T",
-                "commit_id ++ \"\\n\"",
-            ])
-            .lines()
-            .map(String::from)
-            .collect();
-        (commits, self.id("@"))
-    }
-}
-
-fn success(args: &[&str], output: Output) -> String {
-    assert!(
-        output.status.success(),
-        "command {args:?} failed: {}\nstdout:\n{}\nstderr:\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    String::from_utf8(output.stdout).unwrap()
-}
-
-fn set(ids: &[&str]) -> BTreeSet<String> {
-    ids.iter().map(|id| (*id).to_owned()).collect()
-}
+use common::{set, success, Repo};
 
 fn existing_merge_receives_change(description: &str) {
     let repo = Repo::new();
@@ -394,4 +214,116 @@ fn invalid_revisions_fail_without_changing_repository() {
             "repository changed for {revision:?}"
         );
     }
+}
+
+#[test]
+#[cfg(unix)]
+fn stage_alias_inserts_pending_changes_into_existing_megamerge() {
+    let repo = Repo::new();
+    repo.install_stage_alias();
+    let a = repo.change("trunk", "A");
+    let b = repo.change("trunk", "B");
+    let merge = repo.merge(&[&a, &b], "megamerge");
+    let c = repo.change(&merge, "C");
+    repo.jj(&["new"]);
+    let working_copy = repo.id("@");
+
+    repo.jj(&["stage"]);
+
+    assert_eq!(repo.parents(&merge), set(&[&a, &b, &c]));
+    assert_eq!(repo.parents(&c), repo.ids("trunk()"));
+    assert_eq!(repo.id("@"), working_copy);
+    assert_eq!(repo.parents("@"), set(&[&merge]));
+}
+
+#[test]
+#[cfg(unix)]
+fn stage_alias_does_not_fall_back_when_active_stack_has_no_pending_work() {
+    let repo = Repo::new();
+    repo.install_stage_alias();
+    let a = repo.change("trunk", "A");
+    let b = repo.change("trunk", "B");
+    repo.change("trunk", "Unrelated");
+    repo.merge(&[&a, &b], "megamerge");
+    let before = repo.snapshot();
+
+    let output = repo.command("jj").arg("stage").output().unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no commits match revset"));
+    assert_eq!(repo.snapshot(), before);
+}
+
+#[test]
+#[cfg(unix)]
+fn stage_alias_creates_megamerge_from_siblings_without_including_empty_changes() {
+    let repo = Repo::new();
+    repo.install_stage_alias();
+    let a = repo.change("trunk", "A");
+    repo.jj(&["new", "trunk", "-m", "Empty plan"]);
+    let empty_plan = repo.id("@");
+    let b = repo.change("trunk", "B");
+
+    repo.jj(&["stage"]);
+
+    let merge = repo.id("merges()");
+    repo.assert_megamerge_description(&merge);
+    assert_eq!(repo.parents(&merge), set(&[&a, &b]));
+    assert_eq!(repo.parents(&empty_plan), repo.ids("trunk()"));
+    assert_eq!(repo.parents("@"), set(&[&merge]));
+    assert_eq!(repo.ids("@ & empty()"), repo.ids("@"));
+}
+
+#[test]
+#[cfg(unix)]
+fn stage_alias_filters_immutable_foreign_and_non_descendant_changes() {
+    let repo = Repo::new();
+    repo.install_stage_alias();
+    let immutable = repo.change("trunk", "Published");
+    repo.jj(&[
+        "config",
+        "set",
+        "--repo",
+        "revset-aliases.\"immutable_heads()\"",
+        &immutable,
+    ]);
+    success(
+        &["jj", "new", "trunk", "-m", "Foreign"],
+        repo.command("jj")
+            .env("JJ_USER", "Someone Else")
+            .env("JJ_EMAIL", "someone@example.invalid")
+            .args(["new", "trunk", "-m", "Foreign"])
+            .output()
+            .unwrap(),
+    );
+    fs::write(repo.path().join("Foreign.txt"), "foreign\n").unwrap();
+    let foreign = repo.id("@");
+    let other_branch = repo.change("root()", "Other");
+    let a = repo.change("trunk", "A");
+    let b = repo.change("trunk", "B");
+    let foreign_parents = repo.parents(&foreign);
+    let other_parents = repo.parents(&other_branch);
+
+    repo.jj(&["stage"]);
+
+    let merge = repo.id("merges()");
+    assert_eq!(repo.parents(&merge), set(&[&a, &b]));
+    assert_eq!(repo.parents(&immutable), repo.ids("trunk()"));
+    assert_eq!(repo.parents(&foreign), foreign_parents);
+    assert_eq!(repo.parents(&other_branch), other_parents);
+}
+
+#[test]
+#[cfg(unix)]
+fn stage_alias_with_single_change_creates_no_merge() {
+    let repo = Repo::new();
+    repo.install_stage_alias();
+    repo.change("trunk", "A");
+    repo.jj(&["new"]);
+    let before = repo.snapshot();
+
+    repo.jj(&["stage"]);
+
+    assert_eq!(repo.snapshot(), before);
+    assert!(repo.ids("merges()").is_empty());
 }
