@@ -2,6 +2,7 @@ use anyhow::{bail, Result};
 use clap::Parser;
 use xshell::{cmd, Shell};
 
+use super::jj::{find_active_megamerge, list_change_ids};
 use crate::command::CommandRunner;
 
 #[derive(Parser)]
@@ -26,28 +27,27 @@ impl CommandRunner for JjStack {
             bail!("no commits match revset: {rev}");
         }
 
-        let mm = find_megamerge(&sh)?;
+        // Resolve before mutating: expressions such as @- or heads(...) may
+        // select different changes after parallelization or rebasing.
+        let selected = matched.join(" | ");
+        let mm = find_active_megamerge(&sh)?;
 
         match mm {
             Some(mm) => {
-                let args = rebase_into_stack_args(&rev, &mm);
+                let args = rebase_into_stack_args(&selected, &mm);
                 sh.cmd("jj").args(&args).run()?;
             }
             None => {
-                let args = parallelize_args();
-                sh.cmd("jj").args(&args).run()?;
-                let args = new_megamerge_args();
-                sh.cmd("jj").args(&args).run()?;
+                cmd!(sh, "jj parallelize {selected}").run()?;
+                let heads = list_change_ids(&sh, &format!("heads({selected})"))?;
+                if heads.len() >= 2 {
+                    cmd!(sh, "jj new {heads...} -m megamerge").run()?;
+                    cmd!(sh, "jj new").run()?;
+                }
             }
         }
         Ok(())
     }
-}
-
-const MEGAMERGE_REVSET: &str = "heads(::@ & merges() & (trunk()..))";
-
-fn find_megamerge(sh: &Shell) -> Result<Option<String>> {
-    Ok(list_change_ids(sh, MEGAMERGE_REVSET)?.into_iter().next())
 }
 
 fn validate_revision(rev: &str) -> Result<()> {
@@ -55,21 +55,6 @@ fn validate_revision(rev: &str) -> Result<()> {
         bail!("--revision must not be empty");
     }
     Ok(())
-}
-
-fn list_change_ids(sh: &Shell, revset: &str) -> Result<Vec<String>> {
-    let template = r#"change_id ++ "\n""#;
-    let out = cmd!(sh, "jj log -r {revset} -T {template} --no-graph").read()?;
-    Ok(parse_change_ids(&out))
-}
-
-pub(crate) fn parse_change_ids(stdout: &str) -> Vec<String> {
-    stdout
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(String::from)
-        .collect()
 }
 
 pub(crate) fn rebase_into_stack_args<'a>(rev: &'a str, megamerge: &'a str) -> Vec<&'a str> {
@@ -82,12 +67,4 @@ pub(crate) fn rebase_into_stack_args<'a>(rev: &'a str, megamerge: &'a str) -> Ve
         "--insert-before",
         megamerge,
     ]
-}
-
-pub(crate) fn parallelize_args() -> Vec<&'static str> {
-    vec!["parallelize", "trunk()..@-"]
-}
-
-pub(crate) fn new_megamerge_args() -> Vec<&'static str> {
-    vec!["commit", "-m", "megamerge"]
 }

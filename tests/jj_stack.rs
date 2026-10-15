@@ -209,67 +209,163 @@ fn stages_change_into_existing_megamerge() {
     existing_merge_receives_change("megamerge");
 }
 
-// Characterization of the broad current heuristic; change this expectation
-// when merge detection is tightened as described in jj-stack-land-plan.md.
 #[test]
-fn currently_treats_semantic_merge_as_megamerge() {
-    existing_merge_receives_change("semantic merge");
+fn leaves_semantic_merges_untouched() {
+    for description in ["semantic merge", "megamerge extra", "megamerge\n\nDetails"] {
+        let repo = Repo::new();
+        let a = repo.change("trunk", "A");
+        let b = repo.change("trunk", "B");
+        let c = repo.change("trunk", "C");
+        repo.merge(&[&a, &b], description);
+        let before = repo.snapshot();
+
+        repo.stage(&c);
+
+        assert_eq!(
+            repo.snapshot(),
+            before,
+            "merge description: {description:?}"
+        );
+    }
 }
 
-fn fallback_parallelizes_chain(select_unrelated: bool) {
+#[test]
+fn parallelizes_selected_chain_and_creates_megamerge() {
     let repo = Repo::new();
     let trunk = repo.id("trunk()");
-    let c = repo.change("trunk", "C");
     let a = repo.change("trunk", "A");
     let b = repo.change(&a, "B");
     repo.jj(&["new"]);
     let former_working_copy = repo.id("@");
-    let selection = if select_unrelated {
-        c.clone()
-    } else {
-        format!("{a} | {b}")
-    };
 
-    repo.stage(&selection);
+    // This graph-dependent revset must be resolved before parallelization.
+    repo.stage("trunk()..@-");
 
-    for revision in [&a, &b, &c] {
+    for revision in [&a, &b] {
         assert_eq!(repo.parents(revision), set(&[&trunk]));
     }
-    repo.assert_megamerge_description(&former_working_copy);
-    assert_eq!(repo.parents(&former_working_copy), set(&[&a, &b]));
-    assert_eq!(repo.ids("merges()"), set(&[&former_working_copy]));
+    let merge = repo.id("merges() & description(substring:megamerge)");
+    repo.assert_megamerge_description(&merge);
+    assert_eq!(repo.parents(&merge), set(&[&a, &b]));
+    assert_ne!(merge, former_working_copy);
+    // jj abandons the old empty, undescribed working copy when creating the
+    // merge. A fresh empty child is the only working copy we need to retain.
     assert_ne!(repo.id("@"), former_working_copy);
-    assert_eq!(repo.parents("@"), set(&[&former_working_copy]));
+    assert_eq!(repo.parents("@"), set(&[&merge]));
     assert_eq!(repo.ids("@ & empty()"), repo.ids("@"));
 }
 
 #[test]
-fn fallback_parallelizes_ancestors_and_commits_working_copy_as_megamerge() {
-    fallback_parallelizes_chain(false);
+fn selected_siblings_create_megamerge_and_preserve_unselected_work() {
+    let repo = Repo::new();
+    let a = repo.change("trunk", "A");
+    let b = repo.change("trunk", "B");
+    let c = repo.change("trunk", "C");
+    // Leave real uncommitted work in @; creating the merge must preserve it.
+    fs::write(repo.path().join("pending.txt"), "pending\n").unwrap();
+    let c_commit = repo.jj(&["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+
+    repo.stage(&format!("{a} | {b}"));
+
+    let merge = repo.id("merges() & description(substring:megamerge)");
+    repo.assert_megamerge_description(&merge);
+    assert_eq!(repo.parents(&merge), set(&[&a, &b]));
+    assert_eq!(repo.parents("@"), set(&[&merge]));
+    assert_eq!(repo.ids("@ & empty()"), repo.ids("@"));
+    assert_eq!(
+        repo.jj(&["log", "--no-graph", "-r", &c, "-T", "commit_id"]),
+        c_commit
+    );
+    assert_eq!(
+        repo.jj(&["file", "show", "-r", &c, "pending.txt"]),
+        "pending\n"
+    );
+    assert!(!repo.path().join("pending.txt").exists());
 }
 
-// Known limitation: the fallback uses trunk()..@- instead of --revision.
 #[test]
-fn fallback_currently_ignores_selected_revision() {
-    fallback_parallelizes_chain(true);
+fn selected_working_copy_is_preserved_as_one_of_three_parents() {
+    let repo = Repo::new();
+    let a = repo.change("trunk", "A");
+    let b = repo.change("trunk", "B");
+    let c = repo.change("trunk", "C");
+
+    repo.stage(&format!("{a} | {b} | @"));
+
+    let merge = repo.id("merges() & description(substring:megamerge)");
+    repo.assert_megamerge_description(&merge);
+    assert_eq!(repo.parents(&merge), set(&[&a, &b, &c]));
+    assert_eq!(repo.jj(&["file", "show", "-r", &c, "C.txt"]), "C\n");
+    assert_eq!(repo.parents("@"), set(&[&merge]));
+    assert_eq!(repo.ids("@ & empty()"), repo.ids("@"));
 }
 
-// Known limitation: a change named megamerge is created even with one parent.
 #[test]
-fn fallback_currently_creates_single_parent_megamerge() {
+fn single_selected_change_leaves_unrelated_chain_untouched() {
+    let repo = Repo::new();
+    let c = repo.change("trunk", "C");
+    let a = repo.change("trunk", "A");
+    repo.change(&a, "B");
+    repo.jj(&["new"]);
+    let before = repo.snapshot();
+
+    repo.stage(&c);
+
+    assert_eq!(repo.snapshot(), before);
+    assert!(repo.ids("description(substring:megamerge)").is_empty());
+}
+
+#[test]
+fn single_selected_change_does_not_create_megamerge() {
     let repo = Repo::new();
     let a = repo.change("trunk", "A");
     repo.jj(&["new"]);
-    let former_working_copy = repo.id("@");
+    let before = repo.snapshot();
 
     repo.stage(&a);
 
-    repo.assert_megamerge_description(&former_working_copy);
-    assert_eq!(repo.parents(&former_working_copy), set(&[&a]));
+    assert_eq!(repo.snapshot(), before);
     assert!(repo.ids("merges()").is_empty());
-    assert_ne!(repo.id("@"), former_working_copy);
-    assert_eq!(repo.parents("@"), set(&[&former_working_copy]));
-    assert_eq!(repo.ids("@ & empty()"), repo.ids("@"));
+    assert!(repo.ids("description(substring:megamerge)").is_empty());
+}
+
+#[test]
+fn ignores_immutable_megamerge() {
+    let repo = Repo::new();
+    let a = repo.change("trunk", "A");
+    let b = repo.change("trunk", "B");
+    let c = repo.change("trunk", "C");
+    let merge = repo.merge(&[&a, &b], "megamerge");
+    repo.jj(&[
+        "config",
+        "set",
+        "--repo",
+        "revset-aliases.\"immutable_heads()\"",
+        &merge,
+    ]);
+    let before = repo.snapshot();
+
+    repo.stage(&c);
+
+    assert_eq!(repo.snapshot(), before);
+}
+
+#[test]
+fn ambiguous_active_megamerges_fail_before_mutating() {
+    let repo = Repo::new();
+    let a = repo.change("trunk", "A");
+    let b = repo.change("trunk", "B");
+    let c = repo.change("trunk", "C");
+    let first = repo.merge(&[&a, &b], "megamerge");
+    let second = repo.merge(&[&a, &c], "megamerge");
+    repo.merge(&[&first, &second], "semantic merge");
+    let before = repo.snapshot();
+
+    let output = repo.stack(&c);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("multiple active megamerges"));
+    assert_eq!(repo.snapshot(), before);
 }
 
 #[test]
