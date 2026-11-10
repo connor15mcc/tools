@@ -50,9 +50,15 @@ impl CommandRunner for JjLand {
         if list_change_ids(&sh, &format!("{target} & {trunk}::"))?.is_empty() {
             bail!("revision must descend from trunk()");
         }
-        // Removing merge machinery must not discard edits or conflict resolutions.
-        if !list_change_ids(&sh, &format!("{merge} ~ empty()"))?.is_empty() {
-            bail!("active megamerge has changes; move them to a child before landing");
+        let remaining: Vec<_> = parents.iter().filter(|id| *id != target).cloned().collect();
+        let remaining = remaining.join(" | ");
+        let heads = list_change_ids(&sh, &format!("heads(({remaining}) ~ ::{target})"))?;
+        // A surviving megamerge keeps its edits and conflict resolutions. Only
+        // collapsing one into a single branch would discard them.
+        if heads.len() < 2 && !list_change_ids(&sh, &format!("{merge} ~ empty()"))?.is_empty() {
+            bail!(
+                "active megamerge has changes and would be collapsed; move them to a child before landing"
+            );
         }
         let bookmark = trunk_bookmark(&sh, self.bookmark.as_deref())?;
         let bookmark_revset = format!("bookmarks(exact:{})", serde_json::to_string(&bookmark)?);
@@ -65,8 +71,6 @@ impl CommandRunner for JjLand {
             );
         }
 
-        let remaining: Vec<_> = parents.iter().filter(|id| *id != target).cloned().collect();
-        let remaining = remaining.join(" | ");
         // Rebase whole branches, not just their tips, while excluding history
         // already included in the landed branch.
         let roots = list_change_ids(
@@ -80,7 +84,6 @@ impl CommandRunner for JjLand {
             }
             cmd!(sh, "jj rebase -s {sources} -d {target}").run()?;
         }
-        let heads = list_change_ids(&sh, &format!("heads(({remaining}) ~ ::{target})"))?;
         let destinations = if heads.is_empty() {
             vec![target.clone()]
         } else {

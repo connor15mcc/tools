@@ -222,6 +222,28 @@ fn refuses_to_discard_megamerge_edits() {
 }
 
 #[test]
+fn preserves_megamerge_edits_when_merge_survives() {
+    let repo = Repo::new();
+    let a = repo.change("trunk", "A");
+    let b = repo.change("trunk", "B");
+    let c = repo.change("trunk", "C");
+    let merge = repo.merge(&[&a, &b, &c], "megamerge");
+    repo.jj(&["edit", &merge]);
+    std::fs::write(repo.path().join("merge-edits.txt"), "keep me\n").unwrap();
+    repo.jj(&["new"]);
+
+    success(&["jj-land", "-r", &a], land(&repo, &a, &[]));
+
+    assert_eq!(repo.id("trunk()"), a);
+    assert_eq!(repo.parents(&merge), set(&[&b, &c]));
+    repo.assert_megamerge_description(&merge);
+    assert_eq!(
+        repo.jj(&["file", "show", "-r", &merge, "merge-edits.txt"]),
+        "keep me\n"
+    );
+}
+
+#[test]
 fn immutable_remaining_branches_fail_before_bookmark_advances() {
     let repo = Repo::new();
     let a = repo.change("trunk", "A");
