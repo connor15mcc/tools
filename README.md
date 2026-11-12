@@ -13,6 +13,7 @@ cargo install --path=. && tools install
 
 <!-- HELP START -->
 ```
+$ tools --help
 personal tools binary manager
 
 Usage: tools [COMMAND]

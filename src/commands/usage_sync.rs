@@ -185,9 +185,12 @@ fn replace_markers(content: &str, formatted_output: &str) -> anyhow::Result<Stri
 
 fn infer_replace(content: &str, command: &str, help_output: &str) -> anyhow::Result<String> {
     let placeholder = format!("{} --help", command);
-    let pattern = format!(r"```\s*\n\s*{}\s*\n\s*```", regex::escape(&placeholder));
+    let pattern = format!(
+        r"(?s)```[ \t]*\n[ \t]*(?:\$[ \t]+)?{}[ \t]*\n(?:.*?\n)?```",
+        regex::escape(&placeholder)
+    );
     let re = Regex::new(&pattern)?;
-    let replacement = format!("```\n{}\n```", help_output.trim());
+    let replacement = format!("```\n$ {}\n{}\n```", placeholder, help_output.trim());
     Ok(re.replace_all(content, replacement.as_str()).to_string())
 }
 
@@ -198,7 +201,7 @@ fn update_readme(
     infer: bool,
 ) -> anyhow::Result<String> {
     // Format as markdown code block
-    let formatted_output = format!("```\n{}\n```", help_output.trim());
+    let formatted_output = format!("```\n$ {} --help\n{}\n```", command, help_output.trim());
 
     let new_content = if infer {
         let replaced = infer_replace(content, command, help_output)?;
@@ -244,6 +247,7 @@ mod tests {
 
             <!-- HELP START -->
             ```
+            $ test-cmd --help
             Usage: test-cmd [options]
             ```
             <!-- HELP END -->
@@ -274,6 +278,7 @@ mod tests {
 
             <!-- HELP START -->
             ```
+            $ test-cmd --help
             Usage: test-cmd [options]
             ```
             <!-- HELP END -->
@@ -305,6 +310,39 @@ mod tests {
             # Test
 
             ```
+            $ test-cmd --help
+            Usage: test-cmd [options]
+            ```
+
+            End.
+        "};
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_update_readme_infer_mode_existing_prompt() {
+        let content = indoc! {"
+            # Test
+
+            ```
+            $ test-cmd --help
+            old help output
+            ```
+
+            End.
+        "};
+        let command = "test-cmd";
+        let help_output = "Usage: test-cmd [options]";
+        let infer = true;
+
+        let result = update_readme(content, command, help_output, infer).unwrap();
+
+        let expected = indoc! {"
+            # Test
+
+            ```
+            $ test-cmd --help
             Usage: test-cmd [options]
             ```
 
@@ -332,6 +370,7 @@ mod tests {
 
             <!-- HELP START -->
             ```
+            $ test-cmd --help
             Usage: test-cmd [options]
             ```
             <!-- HELP END -->
